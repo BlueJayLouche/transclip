@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.workflow == 'CI' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      # Hosted runners have no graphics chip for the real model, so every system runs
+      # the small one on the processor, through the engine Windows and Linux use.
+      TRANSCLIP_ENGINE: faster
+      TRANSCLIP_MODEL: tiny
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.11.11"
+          cache-dependency-glob: "*.lock"
+      - name: Lock files match the scripts
+        run: |
+          uv lock --check --script app.py
+          uv lock --check --script transcribe.py
+      - run: uv run --script app.py --check
+      - run: uv run --script transcribe.py --check
+      # Starts the app on a throwaway folder, transcribes, searches, corrects, exports, quits.
+      - name: End to end
+        run: uv run --script smoke.py

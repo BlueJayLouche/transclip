@@ -1,0 +1,7 @@
+# Recordings, transcripts and exports never belong in the repository.
+/data/
+/Audio/
+/exports/
+/dist/
+__pycache__/
+.DS_Store
