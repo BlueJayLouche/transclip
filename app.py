@@ -317,7 +317,10 @@ def id_of(recording):
 def pending():
     """The chosen folder (None while it cannot be reached), the recordings in it, and those not yet transcribed."""
     s = settings()
-    folder = Path(s["folder"]) if s["folder"] and os.path.isdir(s["folder"]) else None
+    try:  # listing it is the test: a folder the system will not let us read is no more use than a missing one
+        folder = Path(s["folder"]) if s["folder"] and os.listdir(s["folder"]) is not None else None
+    except OSError:
+        folder = None
     found = recordings(folder, s["depth"]) if folder else []
     return folder, found, [r for r in found if not (TAPES / (id_of(r) + ".json")).exists()]
 

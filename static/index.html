@@ -582,7 +582,7 @@ function renderLibrary() {
   if (document.activeElement !== $('#depth')) $('#depth').value = lib.depth;
   $('#home').textContent = lib.home;
   $('#found').textContent = !lib.folder ? 'Choose the folder your recordings are in.'
-    : !lib.reachable ? 'That folder cannot be reached. Is the drive connected? Everything already transcribed still works without it, except export.'
+    : !lib.reachable ? 'That folder cannot be read. Is the drive connected, and has this computer been told to let Transclip read it? Everything already transcribed still works without it, except export.'
     : `${n(lib.found, 'recording')} found there · ${lib.found - lib.todo} transcribed · ${lib.todo} to do`;
   $('#bar').hidden = !j.running;
   if (j.running) $('#bar').value = j.n ? (Math.max(j.i - 1, 0) + j.fraction) / j.n : 0;

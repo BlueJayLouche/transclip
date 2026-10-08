@@ -31,6 +31,8 @@ The app is not signed by a registered Apple developer, so macOS will refuse to o
 xattr -dr com.apple.quarantine /Applications/Transclip.app
 ```
 
+macOS asks once whether Transclip may read files on an external drive, if that is where your recordings are: the Recordings panel waits until you answer. It asks again after each update, because the app is not signed by a registered developer.
+
 The first launch downloads Python and the app's libraries (a minute or two). The first transcription downloads the speech model (a few GB). After that it works offline.
 
 ### From source, any system
