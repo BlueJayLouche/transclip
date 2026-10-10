@@ -48,11 +48,13 @@ jobs:
       - name: The packaged app starts, answers and quits
         run: |
           export TRANSCLIP_HOME="$RUNNER_TEMP/home"
-          dist/Transclip.app/Contents/MacOS/Transclip --no-open
+          dist/Transclip.app/Contents/MacOS/Transclip --no-open &   # without its window: nobody is there to close it
           for _ in $(seq 1 120); do curl -sf -m 2 -o /dev/null http://127.0.0.1:8790/api/ping && break; sleep 2; done
           curl -sf http://127.0.0.1:8790/api/library
           curl -sf -X POST http://127.0.0.1:8790/api/quit
+          wait $!
           codesign --verify --deep --strict dist/Transclip.app
+          iconutil --convert iconset --output "$RUNNER_TEMP/icon.iconset" dist/Transclip.app/Contents/Resources/AppIcon.icns
           cat "$HOME/Library/Logs/Transclip.log"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
