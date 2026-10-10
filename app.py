@@ -53,6 +53,15 @@ MIN_SCORE = 0.6
 # ponytail: one archive's convention, built in. A folder with this name holds raw transfers; a titled file
 # elsewhere with the same wording lends the transfer its name and is labelled as a copy. Make it a setting if another archive differs.
 RAW = "recordings"
+# Music is looked for in the sound itself, about a quarter of a second at a time: where there are no words,
+# and the sound is made of tones rather than hiss (FLAT) and keeps changing rather than humming on (CHANGE).
+# ponytail: two measurements with limits found by trial on one archive of cassettes, checked against spectrograms.
+# They cannot tell music from other tonal, changing sound without words (faint voices, a busy room with a hum
+# in it), and music under words is never marked. A trained sound classifier is the step up if that is not enough.
+RATE, FRAME, HOP, PER_BLOCK = 16000, 1024, 512, 8
+BLOCKS = RATE / HOP / PER_BLOCK  # measurements a second
+FLAT, CHANGE = 0.1, 0.15
+SMOOTH, BRIDGE, SHORTEST = 5, 3, 10  # seconds: judged over, a lapse a piece may contain, and the least that counts
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -149,6 +158,59 @@ def transcript(tape_id):
     d = load_tape(tape_id)  # also refuses a bad id before anything else touches the disk
     apply_fixes(d["chunks"], read_fixes(tape_id))
     return d
+
+
+def sound(audio):
+    """Two measures of a recording, each BLOCKS times a second: how like hiss it is (near 1 for hiss, near 0 for
+    clear tones), and how much its make-up changed since the moment before (near 0 for a steady hum)."""
+    import numpy as np
+    n = (len(audio) - FRAME) // HOP // PER_BLOCK * PER_BLOCK
+    lo, hi = 150 * FRAME // RATE, 4000 * FRAME // RATE  # where voices and instruments are; below is rumble and mains hum
+    flat, blocks = [], [np.zeros((0, hi - lo))]
+    for s in range(0, n, 4096):  # a slice at a time, or an hour of sound would need gigabytes
+        at = np.arange(FRAME) + HOP * np.arange(s, min(s + 4096, n))[:, None]
+        m = np.abs(np.fft.rfft(audio[at] * np.hanning(FRAME), axis=1))[:, lo:hi] + 1e-9
+        flat.append((np.exp(np.log(m ** 2).mean(1)) / (m ** 2).mean(1)).reshape(-1, PER_BLOCK).mean(1))
+        blocks.append(m.reshape(-1, PER_BLOCK, hi - lo).mean(1))
+    b = np.concatenate(blocks)
+    before = np.concatenate([b[:1], b[:-1]])
+    return np.stack([np.concatenate(flat or [[]]), np.abs(b - before).sum(1) / (b + before).sum(1)]).astype(np.float32)
+
+
+def music(measured, words):
+    """The stretches without words that sound like music, as [start, end] in seconds."""
+    import numpy as np
+    flat, change = measured
+    if not len(flat):
+        return []
+    k = int(SMOOTH * BLOCKS) // 2
+    smooth = lambda v: np.median(np.lib.stride_tricks.sliding_window_view(np.pad(v, k, mode="edge"), 2 * k + 1), axis=1)
+    edges = lambda mask: np.flatnonzero(np.diff(np.concatenate([[0], mask.astype(np.int8), [0]]))).reshape(-1, 2)
+    wordless = np.ones(len(flat), bool)
+    for w in words:  # half a second clear of every word
+        wordless[max(int((w["s"] - 0.5) * BLOCKS), 0):int((w["e"] + 0.5) * BLOCKS) + 1] = False
+    found = wordless & (smooth(flat) < FLAT) & (smooth(change) > CHANGE)
+    for a, b in edges(~found):  # a short lapse inside a piece does not end it
+        if a and b < len(found) and b - a <= BRIDGE * BLOCKS and wordless[a:b].all():
+            found[a:b] = True
+    return [[round(a / BLOCKS, 1), round(b / BLOCKS, 1)] for a, b in edges(found) if b - a >= SHORTEST * BLOCKS]
+
+
+def shown(tape_id):
+    """A recording's transcript as the page gets it: as it now stands, with where the music is."""
+    import numpy as np
+    d = transcript(tape_id)
+    kept = TAPES / (tape_id + ".sound.npy")  # measured once, from the listening copy, the first time the recording is opened
+    if not kept.exists():
+        heard = subprocess.run([FFMPEG, "-v", "error", "-i", str(TAPES / (tape_id + ".m4a")), "-f", "f32le", "-ac", "1",
+                                "-ar", str(RATE), "-"], capture_output=True)
+        if heard.returncode:  # no listening copy to measure: the transcript is still worth showing
+            return {**d, "music": []}
+        # ponytail: the whole recording in memory at once, as the transcriber has it: about 4 MB a minute.
+        part = kept.with_name(kept.name + ".part.npy")
+        np.save(part, sound(np.frombuffer(heard.stdout, np.float32)))
+        os.replace(part, kept)
+    return {**d, "music": music(np.load(kept), [w for c in d["chunks"] for w in c["words"]])}
 
 
 def norm(word):
@@ -502,7 +564,7 @@ def transcribe_stop():
 
 @app.get("/api/transcript/<path:tape_id>")
 def get_transcript(tape_id):
-    return jsonify(transcript(tape_id))
+    return jsonify(shown(tape_id))
 
 
 @app.post("/api/fix")
@@ -519,7 +581,7 @@ def fix():
         abort(400, "text must be a string of at most 2000 characters, or null")
     fixes = revise(machine, read_fixes(tape_id), s, e, text)
     dump(fixes_file(tape_id), fixes)
-    return jsonify(transcript(tape_id))
+    return jsonify(shown(tape_id))
 
 
 @app.get("/api/tapes")
@@ -671,6 +733,14 @@ def check():
         assert recordings(d, 1) == ["10. b/Side A.wav", "top.WAV"], recordings(d, 1)
         assert recordings(d, 2) == ["2. a/x/deep.mp3", "10. b/Side A.wav", "top.WAV"], recordings(d, 2)
     assert id_of("1. Mr. Smith 1966/Side A.wav") == "1. Mr. Smith 1966/Side A"  # a dot in a folder name is not an extension
+    import numpy as np
+    t, rng = np.arange(20 * RATE) / RATE, np.random.default_rng(0)
+    tune = np.sin(2 * np.pi * np.array([262, 330, 392, 523, 440])[(t / 0.4).astype(int) % 5] * t)
+    hum, hiss = np.sin(2 * np.pi * 440 * t) + 0.05 * rng.standard_normal(len(t)), rng.standard_normal(len(t))
+    # A tune, a steady hum, hiss, and the tune again with someone talking over it: only the first is marked.
+    got = music(sound(np.concatenate([tune, hum, hiss, tune]).astype(np.float32)), [{"s": 60 + i, "e": 60.8 + i} for i in range(20)])
+    assert len(got) == 1 and got[0][0] < 2 and 17 < got[0][1] < 22, got
+    assert music(sound(np.zeros(100, np.float32)), []) == []  # too short to measure
     print("ok")
 
 

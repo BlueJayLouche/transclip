@@ -5,6 +5,7 @@ Transcribe a folder of audio recordings, read and search them, and pull clips ou
 Built for making selects from an archive of digitised cassette tapes: hours of speech, uneven quality, not much time.
 
 - **Transcribes on your own computer.** Whisper large-v3, with a time for every word. Stretches in another language are marked and roughly translated into English; stretches with no speech are marked too.
+- **Music is marked** where there are no words: in the transcript ("♪ Music · 3 min 20 s") and as a green band on the waveform. It goes by the sound alone, so take it as a guide: a busy room with a hum in it can be taken for music, and music under speech is not marked.
 - **Transcript and waveform, linked.** Click a word to play from it. Drag across words to make a clip, drag the clip's edges on the waveform to trim it.
 - **Search every recording** by the words spoken (small misspellings and word beginnings count) and by meaning ("working abroad without a permit").
 - **Correct the transcript** where the machine misheard. The original wording is kept and corrected words are marked.
@@ -65,7 +66,7 @@ Everything lives in one folder, `Transclip` in your home folder (set `TRANSCLIP_
 
 | | |
 |---|---|
-| `tapes/` | per recording: the transcript, a small listening copy and the waveform outline, so everything but export works with the recordings' drive unplugged |
+| `tapes/` | per recording: the transcript, a small listening copy, the waveform outline and the measurements music is found from, so everything but export works with the recordings' drive unplugged |
 | `selects.json` | your bins and clips, saved on every change, with one backup per day |
 | `exports/` | a new dated folder per export |
 | `settings.json` | the recordings folder and depth |

@@ -242,11 +242,21 @@ function renderTranscript() {
   const root = $('#transcript');
   root.textContent = ''; words = []; nowWord = null;
   const note = (label, from, to) => root.append(h('div', { className: 'gap', textContent: `${label} · ${span(to - from)}`, onclick: () => seek(from, true) }));
+  // A stretch without words: say where in it there is music, and what the rest is.
+  const quiet = (label, from, to) => {
+    let at = from;
+    for (const [s, e] of tape.music.filter(([s, e]) => e > from && s < to)) {
+      if (s - at >= GAP) note(label, at, s);
+      note('♪ Music', Math.max(s, at), Math.min(e, to));
+      at = Math.min(e, to);
+    }
+    if (to - at >= GAP) note(label, at, to);
+  };
   let prev = null, para = null, paraStart = 0;
   for (const c of tape.chunks) {
     for (const w of c.words) {
       const gap = w.s - (prev ? prev.e : 0);
-      if (gap >= GAP) note(prev?.chunk === c ? 'Voices, no words made out' : 'No speech', prev ? prev.e : 0, w.s);
+      if (gap >= GAP) quiet(prev?.chunk === c ? 'Voices, no words made out' : 'No speech', prev ? prev.e : 0, w.s);
       // New paragraph at a pause, a change of language, or the first full stop after 40 s.
       if (!para || gap >= PARA || prev.chunk.lang !== c.lang || (w.s - paraStart > 40 && /[.?!]$/.test(prev.w))) {
         const gutter = h('span', { className: 'gutter', onclick: () => seek(w.s, true) }, fmt(w.s));
@@ -265,7 +275,7 @@ function renderTranscript() {
     }
   }
   const end = prev ? prev.e : 0;
-  if (tape.duration - end >= GAP) note(words.length ? 'No speech' : 'No speech found on this recording', end, tape.duration);
+  if (tape.duration - end >= GAP) quiet(words.length || tape.music.length ? 'No speech' : 'No speech found on this recording', end, tape.duration);
 }
 
 // ── Playback ───────────────────────────────────────────────────────────────
@@ -380,6 +390,7 @@ function paintRegions() {
     prevEnd = c.end;
   }
   if (tape.duration - prevEnd >= GAP) band(prevEnd, tape.duration, 'rgba(128,128,128,.25)');
+  for (const [s, e] of tape.music) band(s, e, 'rgba(50,170,110,.35)');
   for (const c of allClips()) if (c.tape === tape.id)
     regions.addRegion({ id: c.id, start: c.start, end: c.end, color: c.review ? 'rgba(235,80,160,.4)' : 'rgba(240,150,50,.4)', drag: false, resize: true, ...(c.name && { content: c.name }) });
 }
