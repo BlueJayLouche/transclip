@@ -1,17 +1,23 @@
 #!/bin/bash
-# What runs when Transclip.app is double-clicked. It starts the app in the background and
-# leaves at once, so that every later double-click runs again: app.py then finds the one
-# already running and just shows it in the browser.
+# What runs when Transclip.app is opened. It has uv put Python and the app's libraries in place
+# (downloaded on the first launch and after an update; otherwise there is nothing to do), then
+# turns into that Python. Turning into it, rather than starting it, is what makes the window
+# belong to this app as far as macOS is concerned: Transclip's icon in the Dock, one copy running.
 res="$(cd "$(dirname "$0")/../Resources" && pwd)"
 mkdir -p "$HOME/Library/Logs"
+exec >> "$HOME/Library/Logs/Transclip.log" 2>&1
+export UV="$res/uv"               # app.py starts the transcriber with it
 export PYTHONDONTWRITEBYTECODE=1  # nothing may be written into the app itself
-nohup "$res/uv" run --quiet --script "$res/app/app.py" "$@" >> "$HOME/Library/Logs/Transclip.log" 2>&1 &
 
-# The first launch downloads Python and the app's libraries before anything can be shown.
-# ponytail: looks at the usual port only, and only to decide whether to say "please wait".
-port="${TRANSCLIP_PORT:-8790}"
-for _ in 1 2 3 4 5 6 7 8; do
-  curl -s -m 1 -o /dev/null "http://127.0.0.1:$port/api/ping" && exit 0
-  sleep 0.5
-done
-[ "$1" = "--no-open" ] || osascript -e 'display dialog "Transclip is starting. The first launch downloads what it needs, which can take a few minutes. Your browser will open when it is ready." with title "Transclip" buttons {"OK"} default button 1 giving up after 30' > /dev/null 2>&1 &
+# If that takes more than a few seconds, say why nothing is on screen yet; the notice goes when it is done.
+if [ "$1" != "--no-open" ]; then
+  { sleep 4 && exec osascript -e 'display dialog "Transclip is getting ready. The first launch downloads what it needs, which can take a few minutes. Its window opens when that is done." with title "Transclip" buttons {"OK"} default button 1 giving up after 900' > /dev/null; } &
+  notice=$!
+fi
+# --frozen: exactly what the lock file beside app.py names, and never a write into the app.
+if ! "$UV" sync --quiet --frozen --script "$res/app/app.py"; then
+  [ -n "$notice" ] && kill "$notice" && osascript -e 'display alert "Transclip could not get ready" message "The first launch needs the internet. The details are in Library/Logs/Transclip.log in your home folder."' > /dev/null
+  exit 1
+fi
+[ -n "$notice" ] && kill "$notice"
+exec "$("$UV" python find --script "$res/app/app.py")" "$res/app/app.py" "$@"

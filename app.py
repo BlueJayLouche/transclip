@@ -1,11 +1,15 @@
 # /// script
 # requires-python = "==3.12.*"
-# dependencies = ["flask>=3", "fastembed>=0.9", "imageio-ffmpeg>=0.6", "numpy"]
+# dependencies = [
+#   "flask>=3", "fastembed>=0.9", "imageio-ffmpeg>=0.6", "numpy",
+#   "pywebview>=6; sys_platform == 'darwin'",
+# ]
 # ///
 """Transclip:  uv run app.py
 
 Finds the recordings in a folder you choose, has transcribe.py transcribe them, and
-serves the result to your browser: read, search, select clips, export them.
+shows the result in a window of its own on a Mac and in your browser elsewhere: read,
+search, select clips, export them.
 
 Everything it keeps is in one folder, Transclip in your home folder (TRANSCLIP_HOME
 moves it): tapes/ holds each recording's transcript, listening copy and waveform
@@ -38,7 +42,7 @@ ROOT = Path(__file__).parent
 HOME = Path(os.environ.get("TRANSCLIP_HOME") or Path.home() / "Transclip")
 TAPES, SELECTS, SETTINGS, EXPORTS = HOME / "tapes", HOME / "selects.json", HOME / "settings.json", HOME / "exports"
 PORT = int(os.environ.get("TRANSCLIP_PORT") or 8790)
-QUIET = "--no-open" in sys.argv  # no browser tab and no folder windows: for tests
+QUIET = "--no-open" in sys.argv  # no window, no browser tab and no folder windows: for tests
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # comes with the package, so nothing has to be installed by hand
 # ponytail: two recordings that differ only in extension (a.wav, a.mp3) count as one; keep the extension in the id if that ever bites.
 AUDIO = {".wav", ".aif", ".aiff", ".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wma", ".aac"}
@@ -386,6 +390,19 @@ def status():
             "transcribed": len(library()["tapes"]), "job": _job["state"], "home": str(HOME)}
 
 
+def window(webview, url):
+    """Show the page in a window of the app's own. Returns when the window has been closed."""
+    from Foundation import NSBundle
+    NSBundle.mainBundle().infoDictionary()["CFBundleName"] = "Transclip"  # or the menus say "Quit" where they should say "Quit Transclip"
+    # Words are selected by dragging across them, which a window does not allow unless told to.
+    w = webview.create_window("Transclip", url, width=1440, height=900, min_size=(900, 560), text_select=True)
+    # Closing the window quits, and quitting stops the transcriber: ask first while it is at work.
+    w.events.closing += lambda: setattr(w, "confirm_close", _job["state"]["running"])
+    webview.start(private_mode=False,  # a private window would forget which recording was open
+                  localization={"global.quitConfirmation": "A transcription is still running. Quitting stops it; "
+                                "recordings already finished are kept."})
+
+
 def choose_folder():
     """Ask for a folder with the system's own dialog. Empty if none was chosen."""
     if sys.platform == "darwin":
@@ -569,7 +586,9 @@ def export():
     sel = request.get_json()
     write_selects(sel)
     handle = max(0.0, float(sel.get("handle") or 0))
-    jobs = [(b, n, c, transcript(c["tape"])) for b in sel["bins"] for n, c in enumerate(b["clips"], 1)]
+    # A clip still marked for review stays out. It keeps its place in the numbering, so the others' file names
+    # do not change when it is let through later.
+    jobs = [(b, n, c, transcript(c["tape"])) for b in sel["bins"] for n, c in enumerate(b["clips"], 1) if not c.get("review")]
     jobs = [(b, n, c, tape, original(c["tape"], tape)) for b, n, c, tape in jobs]
     missing = sorted({str(src) for *_, src in jobs if not src.exists()})
     if missing:
@@ -679,6 +698,21 @@ if __name__ == "__main__":
         shutil.copy2(SELECTS, backup)  # one copy per day, as things stood at first launch
     # Get the meaning index ready in the background, so the first such search does not wait for it.
     threading.Thread(target=lambda: (meaning_index(), embedder()), daemon=True).start()
-    if not QUIET:
-        threading.Timer(0.8, webbrowser.open, [f"http://127.0.0.1:{port}"]).start()
-    app.run(host="127.0.0.1", port=port, threaded=True)
+    url, serve = f"http://127.0.0.1:{port}", lambda: app.run(host="127.0.0.1", port=port, threaded=True)
+    try:
+        # ponytail: a window on the Mac only, the one place it has been tried. pywebview also draws one on Windows
+        # (with Edge) and Linux (GTK or Qt): lift the platform limit on the dependency above and try it there.
+        import webview
+    except ImportError:
+        webview = None
+    if QUIET or not webview:
+        QUIET or threading.Timer(0.8, webbrowser.open, [url]).start()
+        serve()
+    else:
+        threading.Thread(target=serve, daemon=True).start()
+        for _ in range(100):  # the window shows whatever answers when it opens, so the page has to be there first
+            if answering(port):
+                break
+            time.sleep(0.05)
+        window(webview, url)
+        os._exit(0)  # the window is the app: closed means quit, and the transcriber goes with us

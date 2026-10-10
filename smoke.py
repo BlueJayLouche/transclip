@@ -132,10 +132,12 @@ def main():
 
         clip = lambda tape, a, b, name: {"id": name, "tape": tape, "start": a, "end": b, "name": name}
         out = call("POST", "/api/export", {"handle": 0.5, "target": 0, "bins": [{"name": "Bin / one", "clips": [
-            clip("Tape 1/Side A", 2.0, 3.5, 'what: a "test"?'), clip("speech", hit["t"], hit["end"], "")]}]})
+            clip("Tape 1/Side A", 2.0, 3.5, 'what: a "test"?'), {**clip("Tape 1/Side A", 4.0, 5.0, "not yet"), "review": True},
+            clip("speech", hit["t"], hit["end"], "")]}]})
         assert (out["clips"], out["failed"]) == (2, 0), out
         made = sorted(p.name for p in (Path(out["dir"]) / "Bin - one").iterdir())
-        assert len(made) == 2 and made[0].endswith(".wav") and made[1].endswith(".flac"), made
+        # The one marked for review is left out, and the clip after it keeps its number.
+        assert len(made) == 2 and made[0].endswith(".wav") and made[1].endswith(".flac") and made[1].startswith("03_"), made
         cut, whole = frames(Path(out["dir"]) / "Bin - one" / made[0]), frames(folder / "Tape 1" / "Side A.wav")
         at = int(1.5 * RATE) * 4  # the clip's start less the handle, in bytes
         # The original's own samples from exactly there; a copy may run on by a fraction of a second, never fall short.
