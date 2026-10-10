@@ -124,6 +124,7 @@ def main():
         print("search", flush=True)
 
         before = call("GET", "/api/transcript/speech")
+        assert before["music"] == [] and call("GET", "/api/transcript/Tape%201/Side%20A")["music"] == [], before["music"]  # a speech and a steady tone
         fixed = call("POST", "/api/fix", {"tape": "speech", "s": hit["t"], "e": hit["end"], "text": "homeland"})
         assert fixed != before and call("GET", "/api/search?q=homeland")["hits"][0]["exact"]
         assert call("POST", "/api/fix", {"tape": "speech", "s": hit["t"], "e": hit["end"], "text": None}) == before
