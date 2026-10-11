@@ -20,14 +20,14 @@ Nothing is uploaded. The recordings are only ever read, and the app answers only
 
 | System | State |
 |---|---|
-| macOS, Apple Silicon | In use. Double-click app with a window of its own. |
+| macOS 14 or later, Apple Silicon | In use. Double-click app with a window of its own. The libraries it runs on are not built for older versions of macOS. |
 | Windows, Linux, Intel Mac | Runs from the command line and shows itself in your browser. CI runs the whole app end to end on Windows and Linux with a small model, but nobody has yet used it on either with real recordings, and the folder chooser there is untried. Without an NVIDIA graphics card, transcription will be much slower than on Apple Silicon. |
 
 ## Install
 
 ### macOS app
 
-Download `transclip-macos-arm64.dmg` from [Releases](../../releases), open it and drag Transclip to Applications.
+Download `transclip-macos-arm64.dmg` from [Releases](../../releases), open it and drag Transclip to Applications. It needs a Mac with Apple Silicon and macOS 14 or later. Working on recordings someone has transcribed and sent you asks little more than that; transcribing them yourself also takes about 4 GB of memory while it runs, so 8 GB is tight and 16 GB comfortable.
 
 The app is not signed by a registered Apple developer, so macOS will refuse to open a downloaded copy until you allow it, once:
 

@@ -717,7 +717,7 @@ async function openSession(name) {
 }
 $('#session').onchange = () => { $('#session').blur(); openSession($('#session').value); };
 $('#makesession').onclick = () => $('#newsession').value.trim() && openSession($('#newsession').value);
-$('#newsession').onkeydown = e => e.key === 'Enter' && $('#makesession').click();
+$('#newsession').onkeydown = e => { if (e.key === 'Enter') $('#makesession').click(); };  // returning false here would swallow every other key
 
 const saveLibrary = () => library({ folder: $('#folder').value, depth: +$('#depth').value });
 $('#lib').onclick = () => { $('#library').showModal(); renderScope(); library(); };
