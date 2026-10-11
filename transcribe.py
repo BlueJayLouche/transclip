@@ -25,6 +25,8 @@ translated into English (anything else). Whatever lies between chunks is
 Whisper large-v3 runs through MLX on Apple Silicon and through faster-whisper
 everywhere else. TRANSCLIP_ENGINE=faster forces the second; TRANSCLIP_MODEL names another model.
 """
+import contextlib
+import io
 import json
 import os
 import platform
@@ -32,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import warnings
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -48,15 +51,40 @@ MLX = (sys.platform == "darwin" and platform.machine() == "arm64"
        and os.environ.get("TRANSCLIP_ENGINE") != "faster")
 
 
+def told():
+    """The bar a download would draw, as words for the app: how much of the speech model has arrived."""
+    from tqdm import tqdm  # comes with the libraries that do the downloading
+
+    class Told(tqdm):
+        got = size = 0  # two counts are kept, bytes received and bytes written out: the app hears the larger
+
+        def __init__(self, *args, **kw):
+            super().__init__(*args, **{**kw, "mininterval": 1})
+
+        def display(self, *args, **kw):
+            if self.unit == "B" and self.total >= 1e6:  # not the count of files, nor the few small ones on their own
+                Told.got, Told.size = max(Told.got, self.n), max(Told.size, self.total)
+                say(note=f"Downloading the speech model: {Told.got / 1e6:,.0f} of {Told.size / 1e6:,.0f} MB")
+
+        def close(self):  # a bar says its piece once more as it is thrown away, which can be long after the download
+            self.disable = True
+
+    return Told
+
+
 class Mlx:
     """Apple Silicon: Whisper on the graphics chip."""
     name = os.environ.get("TRANSCLIP_MODEL") or "mlx-community/whisper-large-v3-mlx"
 
     def __init__(self):
         import mlx.core as mx
+        from huggingface_hub import snapshot_download
         from mlx_whisper.transcribe import ModelHolder
         from silero_vad import load_silero_vad
-        self.model, self.vad = ModelHolder.get_model(self.name, mx.float16), load_silero_vad()
+        # Fetched here and handed over as a folder: left to fetch it itself, mlx_whisper does so without a word.
+        self.path = self.name if Path(self.name).exists() else snapshot_download(self.name, tqdm_class=told())
+        say(note="Loading the speech model")
+        self.model, self.vad = ModelHolder.get_model(self.path, mx.float16), load_silero_vad()
 
     def spans(self, audio):
         import torch
@@ -77,7 +105,7 @@ class Mlx:
         # No initial_prompt with recurring names: tried, it barely helped the
         # spelling and it leaked into unclear passages as invented words.
         result = mlx_whisper.transcribe(
-            clip, path_or_hf_repo=self.name, language=lang,
+            clip, path_or_hf_repo=self.path, language=lang,
             task="transcribe" if lang == "en" else "translate",
             word_timestamps=True, condition_on_previous_text=False,
         )
@@ -90,6 +118,8 @@ class Faster:
 
     def __init__(self):
         from faster_whisper import WhisperModel
+        # ponytail: no count of the download here as there is on the Mac. faster-whisper fetches its own
+        # model and takes no bar; fetch it first, as Mlx does, when Windows or Linux gets an app of its own.
         self.model = WhisperModel(self.name, device="auto", compute_type="auto")
 
     def spans(self, audio):
@@ -195,8 +225,21 @@ def main(jobs):
     # stops the job or goes away the pipe closes, on every system, and so do we.
     if "--stop-with-stdin" in sys.argv:
         threading.Thread(target=lambda: (sys.stdin.read(), os._exit(0)), daemon=True).start()
+    # The app shows the last line printed here as its status, and the last line of a warning is
+    # "warnings.warn(". None is worth printing; one is worth stopping for, before a disk is filled for nothing.
+    warnings.simplefilter("ignore")
+    warnings.filterwarnings("error", message="Not enough free disk space")
     say(note="Loading the speech model (the first time, it is downloaded: a few GB)")
-    engine = (Mlx if MLX else Faster)()
+    try:
+        engine = (Mlx if MLX else Faster)()
+    except Exception as e:
+        if isinstance(e, Warning):  # the download library's own words, which give both sizes
+            say(note=str(e))
+        elif "No space left on device" in str(e):
+            say(note="The disk filled up while the speech model was downloading. Make some room and transcribe again.")
+        else:
+            raise
+        sys.exit(1)
     for i, (src, dst) in enumerate(jobs, 1):
         t0 = time.time()
         say(i=i, n=len(jobs), file=src, fraction=0)
@@ -230,6 +273,17 @@ def check():
         (0.0, "en", {"s": 0.5, "e": 1.0, "w": "en"}), (10.0, "fr", {"s": 10.5, "e": 11.0, "w": "fr"}),
         (20.0, "fr", {"s": 20.5, "e": 21.0, "w": "fr"})], got
     assert seen[-1] == 0.7 and seen == sorted(seen), seen
+
+    # A download as the library reports it: received runs ahead of written out, and files are counted too.
+    Told, heard = told(), io.StringIO()
+    with contextlib.redirect_stdout(heard):
+        received, written, files = Told(total=0, unit="B"), Told(total=0, unit="B"), Told(total=4)
+        received.total = written.total = 3_000_000_000
+        received.update(1_500_000_000), written.update(200_000_000), files.update(1)
+        for bar in (received, files, written):
+            bar.refresh(), bar.close()  # closed here, or each says its piece again as the program ends
+    assert json.loads(heard.getvalue().splitlines()[-1]) == {"note": "Downloading the speech model: 1,500 of 3,000 MB"}
+    assert "files" not in heard.getvalue() and "it/s" not in heard.getvalue(), heard.getvalue()
     print("ok")
 
 
