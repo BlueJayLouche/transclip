@@ -432,7 +432,7 @@ def start_job(folder, todo):
         if proc.wait() == 0 and state["running"]:
             state["note"] = "Finished." if not state["failed"] else f"Finished, but {len(state['failed'])} could not be read."
         elif state["running"]:
-            state["note"] = "The transcriber stopped unexpectedly: " + state["note"]
+            state["note"] = "The transcriber stopped: " + state["note"]
         state["running"] = False
 
     threading.Thread(target=watch, daemon=True).start()
