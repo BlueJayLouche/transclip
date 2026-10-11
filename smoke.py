@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.request
 import wave
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -146,6 +147,78 @@ def main():
         assert len((Path(out["dir"]) / "log.csv").read_text(encoding="utf-8-sig").splitlines()) == 3
         print("export", flush=True)
 
+        # Sharing. Collected without the originals, a recording is what the app keeps of it, and says
+        # nothing of where things are on this computer.
+        plain = call("POST", "/api/share", {"tapes": ["speech"], "raw": False})
+        with zipfile.ZipFile(plain["file"]) as z:
+            assert set(z.namelist()) == {"tapes/speech" + e for e in (".json", ".fixes", ".m4a", ".peaks")}, z.namelist()
+            assert json.loads(z.read("tapes/speech.json"))["source"] == "speech.flac"
+        assert Path(plain["file"]).name.startswith("speech (Transclip "), plain["file"]
+        # Collected with them, forgotten here, and taken back in as on a computer that has no recordings folder:
+        # the one still here is left alone, the other returns as it was, and clips are cut from the original that came along.
+        whole = call("POST", "/api/share", {"tapes": ["speech", "Tape 1/Side A", "no such recording"], "raw": True})
+        assert whole["recordings"] == 2 and whole["bytes"] > (folder / "speech.flac").stat().st_size, whole
+        for f in (tmp / "home" / "tapes").glob("speech.*"):
+            f.unlink()
+        assert set(t["id"] for t in call("GET", "/api/tapes")) == {"Tape 1/Side A"}
+        call("PUT", "/api/library", {"folder": str(tmp / "nowhere"), "depth": 1})
+        assert call("POST", "/api/import", {"file": whole["file"]}) == {"added": 1, "kept": 1, "bad": 0}
+        back = call("GET", "/api/transcript/speech")
+        assert {**back, "source": ""} == {**before, "source": ""}, "the transcript changed on the way"
+        assert Path(back["source"]) == tmp / "home" / "originals" / "speech.flac", back["source"]
+        out = call("POST", "/api/export", {"handle": 0, "target": 0, "bins": [{"name": "Shared", "clips": [clip("speech", hit["t"], hit["end"], "")]}]})
+        assert (out["clips"], out["failed"]) == (1, 0), out
+        # A file from someone else is not trusted: nothing lands outside the library, and a transcript
+        # of the wrong shape is refused rather than left to trip up every other recording.
+        junk = tmp / "junk.zip"
+        with zipfile.ZipFile(junk, "w") as z:
+            z.writestr("tapes/../../escaped.json", "{}"), z.writestr("tapes/broken.json", '{"chunks": 5}'), z.writestr("tapes/note.txt", "hello")
+        assert call("POST", "/api/import", {"file": str(junk)}) == {"added": 0, "kept": 0, "bad": 1}
+        assert not list(tmp.rglob("escaped.json")) and not list(tmp.rglob("broken.json"))
+        assert set(t["id"] for t in call("GET", "/api/tapes")) == {"Tape 1/Side A", "speech"}
+        try:
+            call("POST", "/api/import", {"file": str(tmp / "app.log")})
+            raise AssertionError("a file that is no collection was taken in")
+        except urllib.error.HTTPError as e:
+            assert e.code == 409, e.code
+        print("sharing", flush=True)
+
+        # Sessions: another project is another library, with its own recordings, clips, folder and search.
+        lib = call("PUT", "/api/session", {"name": "Second / project"})
+        assert (lib["session"], lib["sessions"], lib["transcribed"], lib["folder"]) == ("Second - project", ["Second - project"], 0, ""), lib
+        assert call("GET", "/api/tapes") == [] and call("GET", "/api/search?q=country")["total"] == 0
+        assert call("GET", "/api/selects")["bins"][0]["clips"] == []
+        assert call("POST", "/api/import", {"file": plain["file"]})["added"] == 1
+        assert [t["id"] for t in call("GET", "/api/tapes")] == ["speech"] and call("GET", "/api/search?q=country")["total"] >= 1
+
+        # It came without its original and there is no recordings folder here: export names the file it
+        # wants, and takes being told where it is. A file of another length is not taken without insisting.
+        def refused(path, body):
+            try:
+                call("POST", path, body)
+            except urllib.error.HTTPError as e:
+                assert e.code == 409, e.code
+                return json.loads(e.read())
+            raise AssertionError(f"{path} was not refused")
+        cut = {"handle": 0, "target": 0, "bins": [{"name": "Located", "clips": [clip("speech", hit["t"], hit["end"], "")]}]}
+        assert refused("/api/export", cut)["missing"] == [{"tape": "speech", "name": "speech.flac"}]
+        assert "error" in refused("/api/locate", {"tape": "speech", "file": str(tmp / "app.log")})
+        other = refused("/api/locate", {"tape": "speech", "file": str(folder / "Tape 1" / "Side A.wav")})
+        assert other["mismatch"] and round(other["runs"]) == 6 and round(other["was"]) == 11, other
+        assert refused("/api/export", cut)["missing"], "a refused file was kept all the same"
+        moved = tmp / "renamed copy.flac"
+        shutil.copy(folder / "speech.flac", moved)
+        assert call("POST", "/api/locate", {"tape": "speech", "file": str(moved)}) == {"source": str(moved)}
+        out = call("POST", "/api/export", cut)
+        assert (out["clips"], out["failed"]) == (1, 0) and [p.suffix for p in (Path(out["dir"]) / "Located").iterdir()] == [".flac"], out
+        assert (tmp / "home" / "sessions" / "Second - project" / "tapes" / "speech.json").exists()
+        lib = call("PUT", "/api/session", {"name": ""})
+        assert (lib["session"], lib["sessions"], lib["transcribed"]) == ("", ["Second - project"], 2), lib
+        assert call("GET", "/api/selects")["bins"][0]["name"] == "Shared"  # the first library's clips, as they were left
+        assert call("PUT", "/api/session", {"name": "Second - project"})["transcribed"] == 1
+        print("sessions", flush=True)
+
+        assert (tmp / "home" / "session.txt").read_text(encoding="utf-8") == "Second - project"
         assert subprocess.run(start, env=env, timeout=300).returncode == 0  # a second launch finds the first and bows out
         call("POST", "/api/quit")
         assert app.wait(timeout=30) == 0

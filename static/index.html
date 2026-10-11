@@ -97,6 +97,14 @@ dialog .row { display: flex; gap: 8px; align-items: center; }
 #bar { width: 100%; }
 #jobnote, dialog small, dialog .small { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
 #closelib { margin-left: auto; }
+#lib { white-space: nowrap; max-width: 24em; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }  /* a session's name can be long */
+#sessions { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
+#session { flex: 1; min-width: 0; }
+#newsession { flex: 1; min-width: 0; padding: 4px 8px; }
+#share { margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+#share label { margin: 0; white-space: nowrap; }
+#scope { flex: 1; min-width: 0; }
+#sharenote.bad { color: var(--bad); }
 #gone { position: fixed; inset: 0; z-index: 10; display: grid; place-items: center; background: var(--bg); }
 
 footer { grid-column: 1 / -1; background: var(--panel); border-top: 1px solid var(--line); padding-top: 4px; }
@@ -140,6 +148,10 @@ footer { grid-column: 1 / -1; background: var(--panel); border-top: 1px solid va
 </form>
 <dialog id="library">
   <h2>Recordings</h2>
+  <div class="row" id="sessions" title="A session is one project: its own recordings, clips and search. Nothing is shared between sessions.">
+    Session <select id="session"></select>
+    <input id="newsession" spellcheck="false" autocomplete="off" placeholder="Name for a new session"><button id="makesession" type="button">New session</button>
+  </div>
   <label>Folder containing the recordings
     <span class="row"><input id="folder" spellcheck="false" autocomplete="off" placeholder="Type or paste the folder's full path, or choose it"><button id="choose" type="button">Choose…</button></span>
   </label>
@@ -149,6 +161,12 @@ footer { grid-column: 1 / -1; background: var(--panel); border-top: 1px solid va
   <progress id="bar" max="1" value="0" hidden></progress>
   <p id="jobnote"></p>
   <div class="row"><button id="go" type="button"></button><button id="quit" type="button"></button><button id="closelib" type="button">Close</button></div>
+  <div class="row" id="share" title="Collect recordings into one file to give to someone else, or take in a file you were given">
+    <select id="scope"></select>
+    <label title="Include the recordings themselves, so clips can be cut where the file goes. Much bigger."><input id="raw" type="checkbox"> with the originals</label>
+    <button id="collect" type="button">Collect and export</button><button id="import" type="button">Import…</button>
+  </div>
+  <p id="sharenote" class="small"></p>
   <p class="small">Recordings are only read, never changed, and nothing leaves this computer. Transcripts, listening copies, your clips and exports are kept in <span id="home"></span>.</p>
 </dialog>
 <audio id="audio" preload="auto"></audio>
@@ -556,13 +574,29 @@ function save() {
   });
 }
 
+// An original that is not where it is looked for is named, with a way to say where it is. Then what was being done is tried again.
+function offerLocate(tell, el, missing, again, problem) {
+  const [m, ...more] = missing, name = `${m.tape.replaceAll('/', ' / ')} (${m.name})`;
+  const ask = async file => {
+    const r = await fetch('/api/locate', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ tape: m.tape, file, anyway: !!file }) }).catch(() => null);
+    const d = await r?.json().catch(() => null);
+    if (r?.ok && d && !d.cancelled) return again();
+    if (!d?.cancelled) offerLocate(tell, el, missing, again, d ?? { error: 'That did not work. Is Transclip still running?' });
+  };
+  const button = (textContent, file) => h('button', { type: 'button', textContent, onclick: () => ask(file) });
+  tell(problem?.mismatch ? `That file runs ${span(problem.runs)}, and ${name} runs ${span(problem.was)}.`
+    : problem?.error || `The original of ${name} was not found` + (more.length ? `, nor ${more.length} more` : '')
+      + '. Set the recordings folder to where your copies are, or say where this one is.', true);
+  el.append(' ', ...(problem?.mismatch ? [button('Use it anyway', problem.file), ' '] : []), button('Locate it…'));
+}
+
 $('#export').onclick = async () => {
   await saving;
   say('Exporting…');
   try {
     const r = await fetch('/api/export', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sel) });
     const d = await r.json();
-    if (!r.ok) return say(d.error || 'Export failed.', true);
+    if (!r.ok) return d.missing?.length ? offerLocate(say, $('#status'), d.missing, () => $('#export').click()) : say(d.error || 'Export failed.', true);
     say(`Exported ${d.clips - d.failed} of ${d.clips} clips to ${d.dir}` + (d.failed ? `. ${d.failed} failed: see log.csv.` : '') + (held() ? `. ${held()} still to review left out.` : ''), d.failed > 0);
   } catch { say('Export failed. Is Transclip still running?', true); }
 };
@@ -612,7 +646,8 @@ async function library(change) {
     listed = lib.transcribed;
     tapes = await fetch('/api/tapes').then(r => r.json());
     renderTapes();
-    if (!tape && tapes.length) loadTape(firstTape().id);
+    if (!tape && tapes.length) await loadTape(firstTape().id).catch(() => {});
+    renderScope();
   }
 }
 
@@ -620,6 +655,10 @@ function renderLibrary() {
   const j = lib.job, n = (count, word) => `${count} ${word}${count === 1 ? '' : 's'}`;
   if (document.activeElement !== $('#folder')) $('#folder').value = lib.folder;
   if (document.activeElement !== $('#depth')) $('#depth').value = lib.depth;
+  if (document.activeElement !== $('#session')) {
+    $('#session').replaceChildren(...['', ...lib.sessions].map(s => h('option', { value: s, textContent: s || 'Main library' })));
+    $('#session').value = lib.session;
+  }
   $('#home').textContent = lib.home;
   $('#found').textContent = !lib.folder ? 'Choose the folder your recordings are in.'
     : !lib.reachable ? 'That folder cannot be read. Is the drive connected, and has this computer been told to let Transclip read it? Everything already transcribed still works without it, except export.'
@@ -631,11 +670,57 @@ function renderLibrary() {
   $('#go').textContent = j.running ? 'Stop transcribing' : `Transcribe ${n(lib.todo, 'recording')}`;
   $('#go').disabled = !j.running && !lib.todo;
   $('#quit').textContent = j.running ? 'Quit Transclip (stops transcribing)' : 'Quit Transclip';
-  $('#lib').textContent = j.running ? `Transcribing ${j.i || 1} of ${j.n}…` : 'Recordings…';
+  $('#lib').textContent = (lib.session ? lib.session + ' · ' : '') + (j.running ? `Transcribing ${j.i || 1} of ${j.n}…` : 'Recordings…');
 }
 
+// Sharing: collect recordings into one file for someone else, or take in a file from them.
+const inFolder = () => tapes.filter(t => t.id.startsWith(tape.id.split('/')[0] + '/'));
+function renderScope() {
+  const many = list => `${list.length} recording${list.length === 1 ? '' : 's'}`;
+  const choices = [...(tape ? [['one', 'The open recording']] : []),
+    ...(tape?.id.includes('/') ? [['folder', `Its folder, ${tape.id.split('/')[0]} (${many(inFolder())})`]] : []),
+    ['all', `Everything here (${many(tapes)})`]];
+  $('#scope').replaceChildren(...choices.map(([value, textContent]) => h('option', { value, textContent })));
+  $('#collect').disabled = !tapes.length;
+}
+const shareNote = (text, bad) => { $('#sharenote').textContent = text; $('#sharenote').className = bad ? 'small bad' : 'small'; };
+async function shareCall(path, body, busy) {
+  shareNote(busy);
+  $('#collect').disabled = $('#import').disabled = true;
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => null);
+  const d = await r?.json().catch(() => null);
+  $('#collect').disabled = !tapes.length; $('#import').disabled = false;
+  if (d?.missing?.length) offerLocate(shareNote, $('#sharenote'), d.missing, () => $('#collect').click());
+  else if (!r?.ok || !d) shareNote(d?.error || 'That did not work. Is Transclip still running?', true);
+  return r?.ok ? d : null;
+}
+$('#collect').onclick = async () => {
+  const which = $('#scope').value, ids = which === 'one' ? [tape.id] : (which === 'folder' ? inFolder() : tapes).map(t => t.id);
+  const d = await shareCall('/api/share', { tapes: ids, raw: $('#raw').checked }, 'Collecting…');
+  if (d) shareNote(`Collected ${d.recordings} recording${d.recordings === 1 ? '' : 's'} into ${d.file} (${d.bytes < 1e9 ? Math.ceil(d.bytes / 1e6) + ' MB' : (d.bytes / 1e9).toFixed(1) + ' GB'}).`);
+};
+$('#import').onclick = async () => {
+  const d = await shareCall('/api/import', {}, 'Choose the file you were given…');
+  if (!d || d.cancelled) return d && shareNote('');
+  shareNote(`Added ${d.added} recording${d.added === 1 ? '' : 's'}` + (d.kept ? `, left ${d.kept} already here as they were` : '')
+    + (d.bad ? `, could not read ${d.bad}` : '') + '.', !d.added && d.bad > 0);
+  library();  // lists what came in
+};
+
+// A session is another library. Everything on the page belongs to the one that is open, so changing it starts the page afresh.
+async function openSession(name) {
+  await saving;
+  const r = await fetch('/api/session', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }) }).catch(() => null);
+  if (r?.ok) return location.reload();
+  shareNote((await r?.json().catch(() => null))?.error || 'The session could not be changed. Is Transclip still running?', true);
+  library();  // puts the list back on the session that is still open
+}
+$('#session').onchange = () => { $('#session').blur(); openSession($('#session').value); };
+$('#makesession').onclick = () => $('#newsession').value.trim() && openSession($('#newsession').value);
+$('#newsession').onkeydown = e => e.key === 'Enter' && $('#makesession').click();
+
 const saveLibrary = () => library({ folder: $('#folder').value, depth: +$('#depth').value });
-$('#lib').onclick = () => { $('#library').showModal(); library(); };
+$('#lib').onclick = () => { $('#library').showModal(); renderScope(); library(); };
 $('#closelib').onclick = () => $('#library').close();
 $('#folder').onchange = $('#depth').onchange = saveLibrary;
 $('#choose').onclick = async () => {
@@ -678,7 +763,7 @@ document.addEventListener('keydown', e => {
   else $('#transcript').append(h('div', { className: 'gap', textContent: 'No recordings yet. Choose the folder they are in under "Recordings…", then transcribe them.' }));
   requestAnimationFrame(tick);
   await library();
-  if (!tapes.length) $('#library').showModal();
+  if (!tapes.length) { renderScope(); $('#library').showModal(); }
 })();
 </script>
 </body>

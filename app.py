@@ -13,8 +13,11 @@ search, select clips, export them.
 
 Everything it keeps is in one folder, Transclip in your home folder (TRANSCLIP_HOME
 moves it): tapes/ holds each recording's transcript, listening copy and waveform
-outline, selects.json the clips, exports/ what you export. Exports are cut from the
-original recordings, which are only ever read. Corrections to a transcript are kept
+outline, selects.json the clips, exports/ what you export. A session is another such
+folder inside it, in sessions/: one project's recordings, clips and search, apart
+from every other's. Recordings can be collected into one file for someone else and
+imported from one; originals that arrive that way are kept in originals/. Exports are
+cut from the original recordings, which are only ever read. Corrections to a transcript are kept
 beside it in <tape>.fixes and laid over the machine's words when it is read; the
 machine's own transcript is never rewritten. Search by meaning uses a small language
 model kept in models/. Nothing is sent anywhere, and only this computer can reach the app.
@@ -22,6 +25,7 @@ model kept in models/. Nothing is sent anywhere, and only this computer can reac
 import csv
 import json
 import os
+import posixpath
 import re
 import shutil
 import socket
@@ -31,6 +35,7 @@ import threading
 import time
 import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
 
@@ -39,8 +44,12 @@ from flask import Flask, abort, jsonify, request, send_from_directory
 from werkzeug.security import safe_join
 
 ROOT = Path(__file__).parent
-HOME = Path(os.environ.get("TRANSCLIP_HOME") or Path.home() / "Transclip")
+# The first library, and the home of what every session shares: the other sessions, which one is open, the model for meaning.
+BASE = Path(os.environ.get("TRANSCLIP_HOME") or Path.home() / "Transclip")
+# The library being worked on, which open_session() changes: the first one, or a session's folder laid out the same way.
+HOME = BASE
 TAPES, SELECTS, SETTINGS, EXPORTS = HOME / "tapes", HOME / "selects.json", HOME / "settings.json", HOME / "exports"
+ORIGINALS = HOME / "originals"  # recordings that arrived with their transcripts, in a file someone collected
 PORT = int(os.environ.get("TRANSCLIP_PORT") or 8790)
 QUIET = "--no-open" in sys.argv  # no window, no browser tab and no folder windows: for tests
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()  # comes with the package, so nothing has to be installed by hand
@@ -53,6 +62,9 @@ MIN_SCORE = 0.6
 # ponytail: one archive's convention, built in. A folder with this name holds raw transfers; a titled file
 # elsewhere with the same wording lends the transfer its name and is labelled as a copy. Make it a setting if another archive differs.
 RAW = "recordings"
+# What a recording is in a collected file besides its transcript: corrections, the listening copy, the waveform.
+# Where the music is gets measured again from the listening copy, in a second or two.
+EXTRAS = (".fixes", ".m4a", ".peaks")
 # Music is looked for in the sound itself, about a quarter of a second at a time: where there are no words,
 # and the sound is made of tones rather than hiss (FLAT) and keeps changing rather than humming on (CHANGE).
 # ponytail: two measurements with limits found by trial on one archive of cassettes, checked against spectrograms.
@@ -315,7 +327,7 @@ def embedder():
     global _embedder
     if _embedder is None:
         from fastembed import TextEmbedding  # imported late: it takes seconds and only meaning search needs it
-        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=str(HOME / "models"))
+        _embedder = TextEmbedding("BAAI/bge-small-en-v1.5", cache_dir=str(BASE / "models"))
     return _embedder
 
 
@@ -360,6 +372,20 @@ def write_selects(sel):
     dump(SELECTS, sel)
 
 
+def open_session(name):
+    """Work on a session from here on: its recordings, clips, settings and exports, and no other's.
+    One that does not exist yet is made. No name means the first library."""
+    global HOME, TAPES, SELECTS, SETTINGS, EXPORTS, ORIGINALS
+    home = BASE / "sessions" / name if name else BASE
+    (home / "tapes").mkdir(parents=True, exist_ok=True)
+    HOME, TAPES, SELECTS, SETTINGS, EXPORTS, ORIGINALS = (
+        home, home / "tapes", home / "selects.json", home / "settings.json", home / "exports", home / "originals")
+    backup = SELECTS.with_name(f"selects.{time.strftime('%Y-%m-%d')}.bak.json")
+    if SELECTS.exists() and not backup.exists():
+        shutil.copy2(SELECTS, backup)  # one copy per day, as things stood when first opened
+    (BASE / "session.txt").write_text(name, encoding="utf-8")  # the one to come back to at the next launch
+
+
 def settings():
     s = {"folder": "", "depth": 3}
     return {**s, **load(SETTINGS)} if SETTINGS.exists() else s
@@ -395,6 +421,116 @@ def original(tid, tape):
     """Where a recording's original is now: in the chosen folder, or failing that where it was when transcribed."""
     here = Path(settings()["folder"] or ".") / (tid + Path(tape["source"]).suffix)
     return here if here.exists() else Path(tape["source"])
+
+
+def collect(ids, raw):
+    """Gather recordings into one file to give to someone else: what this app keeps of each and,
+    with `raw`, the original recordings too. Returns the file."""
+    what = posixpath.commonpath(ids)  # the one recording, the folder they share, or nothing in particular
+    out = EXPORTS / f"{safe(what) if what else 'Recordings'} (Transclip {time.strftime('%Y-%m-%d %H.%M.%S')}).zip"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    part = out.with_name(out.name + ".part")
+    # Stored, not squeezed: the sound is compressed already or too big to be worth the minutes.
+    # ponytail: one request does the whole job and the page just waits; give it a progress bar if tens of GB become usual.
+    with zipfile.ZipFile(part, "w") as z:
+        for tid in ids:
+            d = load_tape(tid)
+            src = original(tid, d)
+            # The transcript says where the original was on this computer. Its name is all anyone else needs.
+            z.writestr(f"tapes/{tid}.json", json.dumps({**d, "source": src.name}, ensure_ascii=False))
+            for ext in EXTRAS:
+                if (TAPES / (tid + ext)).exists():
+                    z.write(TAPES / (tid + ext), f"tapes/{tid}{ext}")
+            if raw:
+                z.write(src, f"originals/{tid}{src.suffix}")
+    os.replace(part, out)
+    return out
+
+
+def member(name):
+    """What a file in a collected file is, as (folder, recording, extension), or None for anything
+    that has no business there or would land outside the library."""
+    parts = name.split("/")
+    ext = PurePosixPath(name).suffix
+    if (len(parts) < 2 or "\\" in name or ":" in name or any(part in ("", "..") or part.startswith(".") for part in parts)
+            or not (parts[0] == "tapes" and ext in (".json", *EXTRAS) or parts[0] == "originals" and ext.lower() in AUDIO)):
+        return None
+    return parts[0], "/".join(parts[1:])[:-len(ext)], ext
+
+
+def well_formed(d, fixes):
+    """Whether a transcript and its corrections from elsewhere have the shape this app's own do.
+    One that had not would trip up the whole library, not just itself."""
+    num = lambda v: type(v) in (int, float) and v - v == 0  # a number, and not one of the infinite or undefined ones
+    try:
+        return (num(d["duration"]) and isinstance(d["source"], str)
+                and all(num(c["start"]) and num(c["end"]) and bool(re.fullmatch("[a-z]{2,3}", c["lang"]))
+                        and all(num(w["s"]) and num(w["e"]) and isinstance(w["w"], str) for w in c["words"])
+                        for c in d["chunks"])
+                and all(num(f["s"]) and num(f["e"]) and isinstance(f["text"], str) and isinstance(f["was"], str) for f in fixes))
+    except (KeyError, TypeError):
+        return False
+
+
+def take_in(file):
+    """Add the recordings in a collected file to the library. Ones already here are left as they are.
+    The file is someone else's, so nothing in it is taken on trust: see member() and well_formed()."""
+    added = kept = bad = 0
+    with zipfile.ZipFile(file) as z:
+        inside = {m: z.getinfo(n) for n in z.namelist() if (m := member(n))}
+        if sum(i.file_size for i in inside.values()) > shutil.disk_usage(HOME).free:
+            return None
+
+        def put(info, root, name):
+            dest = Path(safe_join(str(root), name))  # refuses a name that climbs out of the folder, should member() ever let one by
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            part = dest.with_name(dest.name + ".part")
+            with z.open(info) as a, open(part, "wb") as b:
+                shutil.copyfileobj(a, b)
+            os.replace(part, dest)
+
+        for (kind, tid, ext), info in sorted(inside.items()):
+            if (kind, ext) != ("tapes", ".json"):
+                continue
+            if (TAPES / (tid + ".json")).exists():
+                kept += 1
+                continue
+            try:
+                # ponytail: read whole, like every transcript here; 50 MB is far beyond a day-long recording's.
+                assert info.file_size < 50e6
+                d = json.loads(z.read(info))
+                fixes = json.loads(z.read(inside["tapes", tid, ".fixes"])) if ("tapes", tid, ".fixes") in inside else []
+                assert well_formed(d, fixes)
+            except (ValueError, AssertionError):
+                bad += 1
+                continue
+            # Never somebody else's idea of where a file is on this computer: the original that came
+            # with it, or just its name, to be looked for in the recordings folder.
+            d["source"] = Path(d["source"].replace("\\", "/")).name
+            for (k, t, e), i in inside.items():
+                if t != tid:
+                    continue
+                if k == "originals":
+                    put(i, ORIGINALS, tid + e)
+                    d["source"] = str(ORIGINALS / (tid + e))
+                elif e != ".json":
+                    put(i, TAPES, tid + e)
+            dump(Path(safe_join(str(TAPES), tid + ".json")), d)  # last: its presence is what makes a recording part of the library
+            added += 1
+    return {"added": added, "kept": kept, "bad": bad}
+
+
+def unfound(ids):
+    """The recordings among these whose original is not where it is looked for, each with the file name wanted."""
+    tapes = library()["tapes"]
+    return [{"tape": t, "name": src.name} for t in sorted(set(ids), key=natural) if not (src := original(t, tapes[t])).exists()]
+
+
+def length(path):
+    """How long a sound file runs, in seconds; None if ffmpeg cannot read it as one."""
+    said = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path)], capture_output=True, text=True, errors="replace").stderr
+    found = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", said)
+    return found and int(found[1]) * 3600 + int(found[2]) * 60 + float(found[3])
 
 
 _job = {"proc": None, "state": {"running": False}}
@@ -449,7 +585,9 @@ def stop_job():
 def status():
     folder, found, todo = pending()
     return {**settings(), "reachable": folder is not None, "found": len(found), "todo": len(todo),
-            "transcribed": len(library()["tapes"]), "job": _job["state"], "home": str(HOME)}
+            "transcribed": len(library()["tapes"]), "job": _job["state"], "home": str(HOME),
+            "session": "" if HOME == BASE else HOME.name,
+            "sessions": sorted((p.name for p in (BASE / "sessions").glob("[!.]*") if p.is_dir()), key=natural)}
 
 
 def window(webview, url):
@@ -465,14 +603,16 @@ def window(webview, url):
                                 "recordings already finished are kept."})
 
 
-def choose_folder():
-    """Ask for a folder with the system's own dialog. Empty if none was chosen."""
+def pick(what, prompt):
+    """Ask for a "folder" or a "file" with the system's own dialog. Empty if none was chosen."""
     if sys.platform == "darwin":
-        cmd = ["osascript", "-e", "activate", "-e", 'POSIX path of (choose folder with prompt "The folder containing your recordings")']
+        # The prompt goes in as an argument, not as part of the script: it may hold a file name that came from someone else.
+        cmd = ["osascript", "-e", "on run argv", "-e", "activate", "-e", f"POSIX path of (choose {what} with prompt (item 1 of argv))",
+               "-e", "end run", prompt]
     else:
         # ponytail: not tried on Windows or Linux yet; the folder can always be typed or pasted instead.
         cmd = [sys.executable, "-c", "import tkinter as t, tkinter.filedialog as f; r = t.Tk(); r.withdraw(); "
-               "r.attributes('-topmost', True); print(f.askdirectory() or '')"]
+               f"r.attributes('-topmost', True); print(f.{'askdirectory' if what == 'folder' else 'askopenfilename'}() or '')"]
     return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
 
 
@@ -542,9 +682,67 @@ def put_library():
     return jsonify(status())
 
 
+@app.put("/api/session")
+def put_session():
+    """Open the session of that name, making it if there is none; with no name, the first library."""
+    if _job["state"]["running"]:
+        return jsonify({"error": "Stop the transcription before changing session: it belongs to this one."}), 409
+    name = str(request.get_json().get("name") or "").strip()
+    open_session(safe(name) if name else "")
+    return jsonify(status())
+
+
 @app.post("/api/choose-folder")
 def choose():
-    return jsonify({"folder": choose_folder()})
+    return jsonify({"folder": pick("folder", "The folder containing your recordings")})
+
+
+@app.post("/api/share")
+def share():
+    """Collect the named recordings into one file in the exports folder."""
+    body = request.get_json()
+    tapes, raw = library()["tapes"], bool(body.get("raw"))
+    ids = [t for t in body.get("tapes") or [] if t in tapes]
+    missing = unfound(ids) if raw else []
+    if missing or not ids:
+        return jsonify({"error": f"{len(missing)} original recording(s) not found. Is the drive connected, and is the "
+                        "recordings folder the right one?" if missing else "No recordings to collect.", "missing": missing}), 409
+    out = collect(ids, raw)
+    reveal(out.parent)
+    return jsonify({"file": str(out), "recordings": len(ids), "bytes": out.stat().st_size})
+
+
+@app.post("/api/locate")
+def locate():
+    """Say where a recording's original is: the file named, or one chosen in the system's dialog.
+    Clips are cut from it from then on, unless the recordings folder has the recording under its own name."""
+    body = request.get_json()
+    tid = body.get("tape", "")
+    d = load_tape(tid)
+    file = body.get("file") or pick("file", f"The original recording of {tid}: {Path(d['source']).name}")
+    if not file:
+        return jsonify({"cancelled": True})
+    runs = length(file) if Path(file).suffix.lower() in AUDIO and Path(file).is_file() else None
+    if runs is None:
+        return jsonify({"error": "That is not a sound file clips can be cut from."}), 409
+    # A file of another length is very likely another recording, and clips would be cut from it at this one's times.
+    if abs(runs - d["duration"]) > 1 and not body.get("anyway"):
+        return jsonify({"mismatch": True, "file": file, "runs": runs, "was": d["duration"]}), 409
+    dump(Path(safe_join(str(TAPES), tid + ".json")), {**d, "source": file})
+    return jsonify({"source": file})
+
+
+@app.post("/api/import")
+def import_recordings():
+    """Take in a file made by /api/share: the one named, or one chosen in the system's dialog."""
+    file = (request.get_json(silent=True) or {}).get("file") or pick("file", "A file of recordings collected in Transclip")
+    if not file:
+        return jsonify({"cancelled": True})
+    try:
+        got = take_in(file)
+    except (OSError, RuntimeError, zipfile.BadZipFile) as e:  # not there, not a zip, or one locked with a password
+        return jsonify({"error": f"That file could not be read as collected recordings: {e}"}), 409
+    return jsonify(got) if got else (jsonify({"error": "There is not enough room on the disk for the recordings in that file."}), 409)
 
 
 @app.post("/api/transcribe")
@@ -652,7 +850,7 @@ def export():
     # do not change when it is let through later.
     jobs = [(b, n, c, transcript(c["tape"])) for b in sel["bins"] for n, c in enumerate(b["clips"], 1) if not c.get("review")]
     jobs = [(b, n, c, tape, original(c["tape"], tape)) for b, n, c, tape in jobs]
-    missing = sorted({str(src) for *_, src in jobs if not src.exists()})
+    missing = unfound(c["tape"] for _, _, c, *_ in jobs)
     if missing:
         return jsonify({"error": f"{len(missing)} original recording(s) not found. Is the drive connected, "
                                  "and is the recordings folder the right one?", "missing": missing}), 409
@@ -692,6 +890,21 @@ def export():
 
 
 def check():
+    # A collected file from elsewhere: what is taken from it, and what is refused.
+    assert member("tapes/Proj/Tape 5.1.2/Side A.json") == ("tapes", "Proj/Tape 5.1.2/Side A", ".json")
+    assert member("originals/Side A.WAV") == ("originals", "Side A", ".WAV") and member("tapes/a.m4a")
+    for name in ("tapes/../../evil.json", "/tapes/a.json", "tapes//a.json", "a.json", "tapes/a.exe", "tapes/.hidden.json",
+                 "tapes\\a.json", "tapes/C:/a.json", "originals/a.json", "elsewhere/a.json", "tapes/a.sound.npy", "tapes/x/"):
+        assert member(name) is None, name
+    word, good = {"s": 1, "e": 1.5, "w": "hello"}, {"s": 1, "e": 2, "text": "hallo", "was": "hello"}
+    ok = lambda **over: {"duration": 9.5, "source": "a.wav", "chunks": [{"start": 0, "end": 9, "lang": "en", "words": [word]}], **over}
+    assert well_formed(ok(), []) and well_formed(ok(), [good]) and well_formed(ok(chunks=[]), [])
+    for d, fixes in ((ok(duration="9"), []), (ok(duration=float("nan")), []), (ok(source=None), []), ({"chunks": []}, []), ([], []),
+                     (ok(chunks=[{"start": 0, "end": 9, "lang": "<b>", "words": []}]), []), (ok(chunks=[{"words": [word]}]), []),
+                     (ok(chunks=[{"start": 0, "end": 9, "lang": "en", "words": [{"s": 1, "e": 2, "w": 3}]}]), []),
+                     (ok(), [{**good, "was": None}]), (ok(), [["s"]]), (ok(), "nonsense")):
+        assert not well_formed(d, fixes), (d, fixes)
+
     assert safe("8. /first/Side A") == "8. - first - Side A", safe("8. /first/Side A")
     assert safe('a:b?"c"') == "a_b__c_" and safe(" . ") == "untitled"
     assert stamp(754.3) == "12m34s" and clock(754.34) == "00:12:34.3" and clock(3599.96) == "01:00:00.0"
@@ -762,10 +975,9 @@ if __name__ == "__main__":
             QUIET or webbrowser.open(f"http://127.0.0.1:{port}")
             sys.exit()
         port += 1  # some other program has that port: take the next
-    TAPES.mkdir(parents=True, exist_ok=True)
-    backup = SELECTS.with_name(f"selects.{time.strftime('%Y-%m-%d')}.bak.json")
-    if SELECTS.exists() and not backup.exists():
-        shutil.copy2(SELECTS, backup)  # one copy per day, as things stood at first launch
+    last = BASE / "session.txt"
+    last = last.read_text(encoding="utf-8").strip() if last.exists() else ""
+    open_session(last if last == safe(last) and (BASE / "sessions" / last).is_dir() else "")
     # Get the meaning index ready in the background, so the first such search does not wait for it.
     threading.Thread(target=lambda: (meaning_index(), embedder()), daemon=True).start()
     url, serve = f"http://127.0.0.1:{port}", lambda: app.run(host="127.0.0.1", port=port, threaded=True)
