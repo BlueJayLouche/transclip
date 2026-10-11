@@ -11,6 +11,8 @@ Built for making selects from an archive of digitised cassette tapes: hours of s
 - **Correct the transcript** where the machine misheard. The original wording is kept and corrected words are marked.
 - **Mark a passage to review** when you are not yet sure of it: it gets its own colour and is kept out of the export until you clear the mark.
 - **Export** clips into named bins: each clip is cut from the original recording, in the original's format, with handles, plus a log sheet (`log.csv`) of tape, in and out points and words.
+- **A session per project**, each with its own recordings, clips and search, so one job's tapes are not in the way of another's.
+- **Hand recordings to someone else** already transcribed: collect them into one file, with or without the originals, and they import it. Nothing has to be transcribed twice.
 
 Nothing is uploaded. The recordings are only ever read, and the app answers only to the computer it runs on.
 
@@ -33,7 +35,7 @@ The app is not signed by a registered Apple developer, so macOS will refuse to o
 xattr -dr com.apple.quarantine /Applications/Transclip.app
 ```
 
-The first launch downloads Python and the app's libraries (a minute or two) before its window opens. The first transcription downloads the speech model (a few GB). After that it works offline.
+The first launch downloads Python and the app's libraries (a minute or two) before its window opens. The first transcription downloads the transcriber's libraries and the speech model, about 5 GB in all, and the status in **Recordings…** counts the model as it arrives. After that it works offline. If it does not get that far, see [If something goes wrong](#if-something-goes-wrong).
 
 If your recordings are on an external drive, macOS asks once whether to allow reading it, and the Recordings panel waits until you answer. The question names "python3.12" rather than Transclip: the app runs on the Python it downloaded, and that is the program macOS sees reading the drive.
 
@@ -60,17 +62,72 @@ uv fetches Python and everything else the first time, ffmpeg included. On a Mac 
 
 Closing the window quits Transclip; while a transcription is running it asks first, because quitting stops it. Where it runs in the browser instead, starting it again just shows it, and **Recordings… → Quit Transclip** stops it.
 
+## Sessions
+
+A session is one project: its own recordings, its own recordings folder, its own clips and exports. Search looks through every recording of the open session and none of any other.
+
+- **Start one:** in **Recordings…**, type a name beside **Session** and press **New session**. It starts empty; choose its recordings folder and transcribe, or import recordings into it.
+- **Switch:** pick another from the **Session** menu. The open session is named on the Recordings… button, and Transclip reopens the one you left.
+- **Main library** is what you had before there were sessions. Nothing in it moves.
+- **Saving** happens as you work; there is nothing to save or close.
+- **Moving recordings into a session:** collect them in the session they are in, switch, and import the file (below). The first session keeps its copy.
+- **Renaming or deleting** a session is renaming or deleting its folder in `sessions/` (see [Where things are kept](#where-things-are-kept)), with Transclip closed.
+
+A session cannot be changed while it is transcribing: stop the transcription first.
+
+## Sharing recordings
+
+Recordings you have transcribed can be handed to someone else, who then has nothing to transcribe.
+
+**Collect and export** (in **Recordings…**) writes one `.zip` into the exports folder and opens the folder. The menu beside it says what goes in: the open recording, the folder it is in, or everything in the session. The file holds each recording's transcript, your corrections, the listening copy and the waveform. That is enough to read, play, search and choose clips. It does not hold your clips, or the place the recordings are kept on your computer.
+
+Tick **with the originals** to put the recordings themselves in as well. The file is then as big as they are, and clips can be cut from them wherever it goes.
+
+**Import…** takes such a file into the open session. Recordings already there are left as they are. Originals that came in the file are kept in `originals/`.
+
+### Where clips are cut from
+
+A clip is always cut from an original recording, never from the listening copy. For each recording Transclip looks, in this order:
+
+1. In the session's recordings folder, for a file with the recording's own name in the same folders below it. For someone who imported your recordings, that means pointing **Recordings… → Folder containing the recordings** at their copies, named and arranged as yours were. The panel then counts them as transcribed, with none to do.
+2. Where it was last told the original is: where it was when transcribed, where an import put it, or the file chosen with **Locate it…**.
+
+When an export cannot find an original it names the recording and the file it wants and offers **Locate it…**: choose the file, under any name and in any folder, and the export carries on. A file that runs more than a second longer or shorter than the recording is questioned first, since it is very likely a different recording; **Use it anyway** takes it.
+
+## If something goes wrong
+
+**The first transcription.** It needs about 5 GB of free disk: about 1.5 GB of libraries and a 3.1 GB speech model. On a Mac the status reads "Downloading the speech model: 1,240 of 3,084 MB" as it comes. With too little room it stops before starting and says how much is needed and how much is free; if the disk fills part-way it says so. Either way nothing is damaged: make room and press **Transcribe** again.
+
+**It sits on "Loading the speech model" for minutes with no count.** Another transcriber may be holding the download. Quit Transclip, run `pkill -f transcribe.py` in Terminal, and open it again.
+
+**Deleting and reinstalling the app changes nothing** about a download: the model and libraries are kept outside it, in `~/.cache/huggingface` and `~/.cache/uv`.
+
+**To watch the download happen**, from a copy of this repository:
+
+```
+echo '[]' > /tmp/none.json && uv run transcribe.py /tmp/none.json && echo "The speech model is ready."
+```
+
+It fetches the same model to the same place, and the app finds it there. If that stalls too, put `HF_HUB_DISABLE_XET=1 ` in front of `uv` to fetch it by the plain route.
+
+**macOS asks whether "python3.12" may read a folder.** That is Transclip (see [Install](#macos-app)). It can ask again for Downloads, Documents or Desktop when a file is imported or located there.
+
+**Anything else:** the app's own messages are in `Library/Logs/Transclip.log` in your home folder.
+
 ## Where things are kept
 
-Everything lives in one folder, `Transclip` in your home folder (set `TRANSCLIP_HOME` to put it elsewhere, or to keep a second, separate library):
+Everything lives in one folder, `Transclip` in your home folder (set `TRANSCLIP_HOME` to put it elsewhere):
 
 | | |
 |---|---|
-| `tapes/` | per recording: the transcript, a small listening copy, the waveform outline and the measurements music is found from, so everything but export works with the recordings' drive unplugged |
+| `tapes/` | per recording: the transcript (which also says where the original is), a small listening copy, the waveform outline and the measurements music is found from, so everything but export works with the recordings' drive unplugged |
 | `selects.json` | your bins and clips, saved on every change, with one backup per day |
-| `exports/` | a new dated folder per export |
+| `exports/` | a new dated folder per export, and the files made by Collect and export |
+| `originals/` | recordings that arrived inside an imported file |
 | `settings.json` | the recordings folder and depth |
 | `models/` | the small model that search by meaning uses |
+| `sessions/<name>/` | each other session, laid out like the folder itself: `tapes/`, `selects.json`, `exports/`, `settings.json`, `originals/` |
+| `session.txt` | which session to reopen |
 
 Deleting a recording's files from `tapes/` makes the app transcribe it again.
 
