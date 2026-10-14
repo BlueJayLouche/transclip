@@ -363,7 +363,9 @@ def recorder(spec):
     threading.Thread(target=listen_for_orders, daemon=True).start()
     if spec.get("file"):
         # Tests: a sound file stands in for an input. It would be over before Record was pressed, so it waits for that.
+        print(json.dumps({"test": "waiting for Record"}), flush=True)
         orders.put(orders.get())
+        print(json.dumps({"test": "playing the file"}), flush=True)
         played = subprocess.Popen([FFMPEG, "-v", "error", "-i", spec["file"], "-af", f"pan=stereo|c0=c{int(spec['left'])}|c1=c{int(spec['right'])}",
                                    "-ar", str(REC_RATE), "-f", "s24le", "-"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
         incoming = lambda: (played.stdout.read(REC_BLOCK), False)
