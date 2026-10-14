@@ -56,7 +56,12 @@ def main():
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
     base = f"http://127.0.0.1:{port}"
-    env = {**os.environ, "TRANSCLIP_HOME": str(tmp / "home"), "TRANSCLIP_PORT": str(port)}
+    # A tape to record from, standing in for a sound input: the deck stopped, six seconds of sound, the deck stopped for good.
+    tone(tmp / "sound.wav")
+    with wave.open(str(tmp / "deck.wav"), "wb") as w:
+        w.setnchannels(2), w.setsampwidth(2), w.setframerate(RATE)
+        w.writeframes(bytes(2 * RATE * 4) + frames(tmp / "sound.wav") + bytes(35 * RATE * 4))
+    env = {**os.environ, "TRANSCLIP_HOME": str(tmp / "home"), "TRANSCLIP_PORT": str(port), "TRANSCLIP_TEST_INPUT": str(tmp / "deck.wav")}
     start = [os.environ.get("UV") or shutil.which("uv"), "run", "--script", str(ROOT / "app.py"), "--no-open"]
     log = open(tmp / "app.log", "w+", encoding="utf-8")
     app = subprocess.Popen(start, env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -217,6 +222,49 @@ def main():
         assert call("GET", "/api/selects")["bins"][0]["name"] == "Shared"  # the first library's clips, as they were left
         assert call("PUT", "/api/session", {"name": "Second - project"})["transcribed"] == 1
         print("sessions", flush=True)
+
+        # Recording a side: nowhere to put it at first, then named, started, and left to end by itself.
+        assert call("GET", "/api/inputs") == [{"name": "Test input", "channels": 2, "rate": RATE, "usual": True}]
+        # No sound is played in a test: with no output to play through, monitoring is refused.
+        assert call("GET", "/api/outputs") == [] and call("GET", "/api/monitor") == {"on": False}
+        try:
+            call("PUT", "/api/monitor", {"input": "Test input", "output": "Speakers"})
+            raise AssertionError("monitoring started with nowhere to play")
+        except urllib.error.HTTPError as e:
+            assert e.code == 409, e.code
+        assert call("PUT", "/api/record", {"device": "Test input", "left": 0, "right": 1})["on"]
+        assert "recordings folder" in refused("/api/record", {"tape": "Reel", "side": "Side A"})["error"]
+        (tmp / "Transfers").mkdir()
+        call("PUT", "/api/library", {"folder": str(tmp / "Transfers"), "depth": 3})
+        assert "name" in refused("/api/record", {"tape": " ", "side": "Side A"})["error"]
+        assert call("POST", "/api/record", {"tape": "Reel: one", "side": "Side A"})["state"] == "waiting"
+        try:
+            done = wait("the side to end by itself", lambda: call("GET", "/api/record")["last"], 1)
+        except AssertionError:  # what the recorder last said is the clue, and it is not in the app's log
+            raise AssertionError(f"the side did not end; the recorder's state: {call('GET', '/api/record')}")
+        master = tmp / "Transfers" / "Reel_ one" / "Side A.wav"
+        # A second of the stopped deck before the sound, all six seconds of it, and three after.
+        assert (done["why"], done["seconds"], done["auto"], done["clipped"], done["lost"], Path(done["file"])) == ("the side ended", 10.0, True, [], [], master), done
+        with wave.open(str(master)) as w:
+            assert (w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()) == (RATE, 2, 3, 10 * RATE)
+            kept = w.readframes(10 * RATE)
+        played = frames(tmp / "sound.wav")  # 16 bits a sample: in the master each has a silent byte beneath it
+        assert kept[RATE * 6:RATE * 6 + 9000] == b"".join(b"\0" + played[i:i + 2] for i in range(0, 6000, 2)), "the master is not what was played"
+        assert not any(kept[:RATE * 6]) and not any(kept[-3 * RATE * 6:]) and [p.name for p in master.parent.iterdir()] == ["Side A.wav"]
+        # It is transcribed without being asked, and its name cannot be used twice.
+        wait("the side to be transcribed", lambda: "Reel_ one/Side A" in {t["id"] for t in call("GET", "/api/tapes")}, 10)
+        assert call("PUT", "/api/record", {"device": "Test input", "left": 0, "right": 1})["on"]
+        again = refused("/api/record", {"tape": "Reel: one", "side": "Side A"})
+        assert "already" in again["error"] and again["exists"] is True, again
+        # Unless it is said that the side is to be recorded again: the old master is then set aside, not destroyed,
+        # and this time the stop level is given, not learned.
+        assert call("POST", "/api/record", {"tape": "Reel: one", "side": "Side A", "replace": True, "below": -90})["state"] == "waiting"
+        done = wait("the side to be recorded again", lambda: call("GET", "/api/record")["last"], 1)
+        assert (done["why"], done["seconds"], Path(done["file"])) == ("the side ended", 10.0, master), done
+        assert sorted(p.name.split(".replaced")[0] for p in master.parent.iterdir()) == ["Side A.wav", "Side A.wav"], list(master.parent.iterdir())
+        wait("the new side to be transcribed", lambda: "Reel_ one/Side A" in {t["id"] for t in call("GET", "/api/tapes")}, 10)
+        call("DELETE", "/api/record?all")
+        print("recording", flush=True)
 
         assert (tmp / "home" / "session.txt").read_text(encoding="utf-8") == "Second - project"
         assert subprocess.run(start, env=env, timeout=300).returncode == 0  # a second launch finds the first and bows out

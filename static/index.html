@@ -96,7 +96,38 @@ dialog .row { display: flex; gap: 8px; align-items: center; }
 #depth { width: 4.5em; }
 #bar { width: 100%; }
 #jobnote, dialog small, dialog .small { color: var(--dim); font-size: 13px; overflow-wrap: anywhere; }
-#closelib { margin-left: auto; }
+#closelib, #recclose { margin-left: auto; }
+#rec { white-space: nowrap; flex-shrink: 0; }
+#recorder label.grow { flex: 1; }
+#recorder label input { width: 100%; padding: 4px 8px; box-sizing: border-box; }
+#input { flex: 1; min-width: 0; }
+#meter { display: grid; grid-template-columns: 1.2em 1fr; gap: 4px 6px; margin: 12px 0 4px; }
+#meter .names { display: grid; gap: 4px; line-height: 12px; }
+#meter .bars { display: grid; gap: 4px; position: relative; }
+#meter .bar { height: 12px; border-radius: 3px; overflow: hidden; background: linear-gradient(90deg, #3a6 0 82%, #db3 94%, #e44 100%); }
+#meter .bar i { display: block; height: 100%; margin-left: auto; width: 100%; background: var(--line); }  /* covers what is not lit */
+#meter .bars b { position: absolute; top: -3px; bottom: -3px; width: 2px; margin-left: -1px; }  /* a level marked across both bars */
+#markstop { background: #6af; }
+#marktarget { background: #fa3; }
+#mdb { grid-column: 1 / -1; display: flex; gap: 1.2em; align-items: baseline; flex-wrap: wrap; }
+#mtop.over { color: #fa3; }
+#mreset { border: 0; background: none; color: var(--dim); padding: 0; text-decoration: underline; font-size: inherit; }
+#clip.on { color: var(--bad); font-weight: 600; }
+#recorder .levels label { flex: 1; display: flex; gap: 6px; align-items: center; white-space: nowrap; }
+#recorder .levels input { flex: 1; min-width: 0; width: auto; padding: 0; }
+#recorder .levels output { min-width: 7.5em; color: var(--dim); font-size: 13px; }
+#monrow { flex-wrap: wrap; margin: 10px 0 4px; }
+#monrow label { margin: 0; white-space: nowrap; display: flex; gap: 6px; align-items: center; }
+#recorder #mon { width: auto; padding: 0; }
+#monout { flex: 1; min-width: 0; }
+#recstate { font-size: 20px; font-weight: 700; letter-spacing: .03em; min-height: 1.5em; margin: 12px 0 2px; }
+#recstate.armed { color: #fa3; animation: armed .7s ease-in-out infinite alternate; }
+#recstate.ending { color: #fa3; }
+#recstate.on { color: var(--bad); }
+@keyframes armed { to { opacity: .4; } }
+#recnote { min-height: 2.8em; margin-top: 2px; overflow-wrap: anywhere; }
+#recnote.bad { color: var(--bad); }
+#recgo { min-width: 9em; padding: 6px 12px; font-weight: 600; }
 #lib { white-space: nowrap; max-width: 24em; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }  /* a session's name can be long */
 #sessions { margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line); }
 #session { flex: 1; min-width: 0; }
@@ -118,6 +149,7 @@ footer { grid-column: 1 / -1; background: var(--panel); border-top: 1px solid va
 <header>
   <select id="tape" title="Recording"></select>
   <button id="lib" title="Choose the folder your recordings are in, and transcribe them">Recordings…</button>
+  <button id="rec" title="Record a tape from a sound input" hidden>Record…</button>
   <button id="play" title="Play / pause (Space)">▶</button>
   <span id="time">00:00 / 00:00</span>
   <label title="Zoom the waveform">Zoom <input id="zoom" type="range" min="0" max="250" value="0"></label>
@@ -168,6 +200,35 @@ footer { grid-column: 1 / -1; background: var(--panel); border-top: 1px solid va
   </div>
   <p id="sharenote" class="small"></p>
   <p class="small">Recordings are only read, never changed, and nothing leaves this computer. Transcripts, listening copies, your clips and exports are kept in <span id="home"></span>.</p>
+</dialog>
+<dialog id="recorder">
+  <h2>Record a tape</h2>
+  <label>Input
+    <span class="row"><select id="input"></select><span id="pair">channels <select id="chl" title="Goes to the left of the master"></select> and <select id="chr" title="Goes to the right of the master"></select></span></span>
+  </label>
+  <div id="meter" title="The level coming in. Set the gain on your interface or deck: Transclip only measures, and the master is exactly what arrives.">
+    <div class="names"><span>L</span><span>R</span></div>
+    <div class="bars"><div class="bar"><i id="ml"></i></div><div class="bar"><i id="mr"></i></div><b id="markstop" title="Stop level"></b><b id="marktarget" title="Target max"></b></div>
+    <small id="mdb"><span id="mnum"></span><span id="mtop"></span><button id="mreset" type="button" title="Forget the loudest and quietest heard so far">reset</button><span id="clip">clipped</span></small>
+  </div>
+  <div class="row levels">
+    <label title="The deck counts as stopped while the input is under this level (the blue mark). All the way left, it is learned from the moments between Record and the tape starting. Set it between what the meter reads with the deck stopped and what it reads on blank tape.">Stop level <input id="stoplevel" type="range" min="-101" max="-30" step="1"><output id="stopval"></output></label>
+    <label title="Where you want the loudest part of the tape to reach (the orange mark). Set the gain on your interface or deck to bring it there.">Target max <input id="target" type="range" min="-24" max="0" step="1"><output id="targetval"></output></label>
+  </div>
+  <div class="row" id="monrow" title="Play the input through to an output, to hear the tape. It has no part in the recording: the master is the same with it on or off, and it can be switched while a side is recording." hidden>
+    <label><input id="mon" type="checkbox"> Monitor</label>
+    <select id="monout" title="Where to play it"></select>
+    <span id="monpair">outputs <select id="monl"></select> and <select id="monr"></select></span>
+    <select id="monhear" title="A tape recorded on one track is heard in one ear unless that track is sent to both"><option value="both">as recorded</option><option value="left">left in both ears</option><option value="right">right in both ears</option></select>
+  </div>
+  <div class="row">
+    <label class="grow">Tape <input id="tapename" spellcheck="false" autocomplete="off" placeholder="The tape's name"></label>
+    <label>Side <input id="sidename" spellcheck="false" autocomplete="off" value="Side A"></label>
+  </div>
+  <p id="recstate"></p>
+  <p id="recnote"></p>
+  <div class="row"><button id="recgo" type="button">Record</button><button id="recclose" type="button">Close</button></div>
+  <p class="small">Press Record with the deck stopped, wait for ARMED, then press Play on the deck. The master begins a second before the tape's first sound, and the side ends by itself once the deck has been stopped for 30 seconds. It is written to this session's recordings folder as a 24-bit, 48 kHz WAV, and transcribed as soon as it ends.</p>
 </dialog>
 <audio id="audio" preload="auto"></audio>
 
@@ -735,11 +796,168 @@ $('#quit').onclick = async () => {
   $('#library').close();
   document.body.append(h('div', { id: 'gone', textContent: 'Transclip has quit. Your clips are saved. Open Transclip again to carry on.' }));
 };
+// ── Recording a tape ───────────────────────────────────────────────────────
+
+let rec = null, recInputs = [], recTimer = null, clipLit = 0, sure = 0, recTold = null;  // recTold: the finished side already reported
+const going = () => rec?.state === 'waiting' || rec?.state === 'playing';
+// Text is only touched when it changes. Redrawing a button while it is being pressed loses the press in the Mac's window.
+const put = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+const recSay = (text, bad) => { put($('#recnote'), text); $('#recnote').className = bad ? 'bad' : ''; };
+const recCall = async (method, body, query = '') => {
+  const r = await fetch('/api/record' + query, { method, headers: { 'Content-Type': 'application/json' }, body: body && JSON.stringify(body) }).catch(() => null);
+  return { ok: !!r?.ok, d: await r?.json().catch(() => null) };
+};
+const theInput = () => recInputs.find(i => i.name === $('#input').value);
+// "Side A" is followed by "Side B", "Side 3" by "Side 4".
+const nextSide = side => side.replace(/[A-Ya-y0-8]$/, c => String.fromCharCode(c.charCodeAt(0) + 1));
+const onBar = db => Math.max(0, Math.min(1, ((db ?? -144) + 100) / 100)) * 100 + '%';  // the bars run from -100 dBFS to full scale
+const stopSet = () => +$('#stoplevel').value <= -101 ? null : +$('#stoplevel').value;  // null: learned from the lead-in
+
+// The channel menus for the chosen input: the pair used last time on it, or its first two.
+function recChannels() {
+  const n = theInput()?.channels || 1, same = localStorage.recInput === $('#input').value;
+  for (const [sel, kept, first] of [['#chl', localStorage.recLeft, 0], ['#chr', localStorage.recRight, 1]]) {
+    $(sel).replaceChildren(...Array.from({ length: n }, (_, i) => h('option', { value: i, textContent: i + 1 })));
+    $(sel).value = Math.min(same && kept != null ? +kept : first, n - 1);
+  }
+  $('#pair').hidden = n < 2;
+}
+// Listen to the chosen input and channels: the meter runs from here on.
+async function recListen() {
+  if (!theInput()) return recSay('No sound input was found on this computer.', true);
+  Object.assign(localStorage, { recInput: $('#input').value, recLeft: $('#chl').value, recRight: $('#chr').value });
+  const { ok, d } = await recCall('PUT', { device: $('#input').value, left: +$('#chl').value, right: +$('#chr').value });
+  recSay(!ok ? d?.error || 'The input could not be opened. Is Transclip still running?'
+    : (d.rescued?.length ? `A recording that was cut short has been kept: ${d.rescued.join(', ')}. ` : '')
+      + (d.rate && d.rate !== 48000 ? `This input is running at ${d.rate / 1000} kHz and is converted to 48 kHz. Set it to 48 kHz for a master that is not converted.` : ''), !ok);
+}
+// Monitoring: the input played through to an output by a program apart from the recorder.
+let recOutputs = [];
+function monChannels() {
+  const n = recOutputs.find(o => o.name === $('#monout').value)?.channels || 2, same = localStorage.monOut === $('#monout').value;
+  for (const [sel, kept, first] of [['#monl', localStorage.monL, 0], ['#monr', localStorage.monR, 1]]) {
+    $(sel).replaceChildren(...Array.from({ length: n }, (_, i) => h('option', { value: i, textContent: i + 1 })));
+    $(sel).value = Math.min(same && kept != null ? +kept : first, n - 1);
+  }
+  $('#monpair').hidden = n <= 2;
+}
+// Start it, start it afresh with what is now chosen, or stop it: whichever the tick box says.
+async function monitorSet() {
+  Object.assign(localStorage, { monOut: $('#monout').value, monL: $('#monl').value, monR: $('#monr').value, monHear: $('#monhear').value });
+  const wanted = $('#mon').checked;
+  const r = await fetch('/api/monitor', !wanted ? { method: 'DELETE' } : { method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ input: $('#input').value, left: +$('#chl').value, right: +$('#chr').value, output: $('#monout').value,
+      out_left: +$('#monl').value, out_right: +$('#monr').value, hear: $('#monhear').value }) }).catch(() => null);
+  const failed = why => { $('#mon').checked = false; recSay(`The input could not be played through${why ? ': ' + why : '.'}`, true); };
+  if (!wanted) return;
+  if (!r?.ok) return failed((await r?.json().catch(() => null))?.error);
+  setTimeout(async () => {  // an output that will not open says so a moment later
+    const m = await fetch('/api/monitor').then(r => r.json()).catch(() => null);
+    if ($('#mon').checked && m && !m.on) failed(m.error);
+  }, 1500);
+}
+$('#mon').onchange = monitorSet;
+$('#monout').onchange = () => { monChannels(); if ($('#mon').checked) monitorSet(); };
+$('#monl').onchange = $('#monr').onchange = $('#monhear').onchange = () => { if ($('#mon').checked) monitorSet(); };
+
+// The two levels the person sets, drawn as marks across the meter.
+function recLevels() {
+  const stop = stopSet() ?? rec?.below ?? null, target = +$('#target').value;
+  put($('#stopval'), stopSet() != null ? `${stopSet()} dBFS` : rec?.below != null ? `learned: ${Math.round(rec.below)} dBFS` : 'learned from the lead-in');
+  put($('#targetval'), `${target} dBFS`);
+  $('#markstop').hidden = stop == null;
+  $('#markstop').style.left = onBar(stop);
+  $('#marktarget').style.left = onBar(target);
+}
+async function recTick() {
+  const r = await fetch('/api/record').catch(() => null);
+  if (!r?.ok) return;
+  rec = await r.json();
+  $('#ml').style.width = `calc(100% - ${onBar(rec.l)})`;
+  $('#mr').style.width = `calc(100% - ${onBar(rec.r)})`;
+  const heard = rec.on && rec.l != null, top = heard ? Math.max(...rec.top) : null, target = +$('#target').value;
+  put($('#mnum'), heard ? `L ${rec.l.toFixed(1)}   R ${rec.r.toFixed(1)} dBFS` : '');
+  put($('#mtop'), heard ? `loudest so far L ${rec.top[0].toFixed(1)}  R ${rec.top[1].toFixed(1)} (${Math.abs(top - target).toFixed(1)} dB ${top > target ? 'over' : 'under'} target) · quietest ${rec.quietest.toFixed(1)}` : '');
+  $('#mtop').className = heard && top > target ? 'over' : '';
+  if (rec.clip) clipLit = Date.now() + 3000;
+  $('#clip').className = Date.now() < clipLit ? 'on' : '';
+  $('#clip').style.visibility = Date.now() < clipLit ? 'visible' : 'hidden';
+  recLevels();
+  const armed = rec.state === 'waiting', playing = rec.state === 'playing', ending = playing && rec.stopped >= 3;
+  put($('#recstate'), armed ? 'ARMED · press Play on the deck' : ending ? `DECK STOPPED · the side ends in ${Math.ceil(30 - rec.stopped)} s`
+    : playing ? `● RECORDING · ${rec.side} · ${fmt(rec.seconds)}` : '');
+  $('#recstate').className = armed ? 'armed' : ending ? 'ending' : playing ? 'on' : '';
+  put($('#recgo'), armed ? 'Cancel' : ending ? 'End side now' : playing ? (Date.now() < sure ? 'Press again to stop' : 'Stop') : 'Record');
+  $('#recgo').disabled = !rec.on;
+  for (const id of ['#input', '#chl', '#chr', '#tapename', '#sidename', '#recclose']) $(id).disabled = going();
+  if (going()) {
+    recSay(rec.lost ? `The sound system has lost sound ${rec.lost} time${rec.lost === 1 ? '' : 's'} on this side: the master will have gaps.`
+      : armed ? 'Waiting for the tape. The master will begin a second before its first sound.'
+      : rec.auto === false ? 'The input was not quiet when Record was pressed, so this side will not end by itself: press Stop when it is over, or set a stop level.'
+      : ending ? 'Sound returning carries the side on.' : '', rec.lost > 0);
+  } else if (rec.last && recTold !== rec.last.file + rec.last.seconds) {  // a side has just finished
+    recTold = rec.last.file + rec.last.seconds;
+    const d = rec.last, why = { 'the side ended': 'it ended by itself when the deck stopped', stopped: 'stopped by you' }[d.why] || d.why;
+    recSay(d.file ? `${d.side} is recorded: ${span(d.seconds)}, ${why}. Saved as ${d.file}. It is being transcribed and will appear in the list.`
+      + (d.clipped?.length ? ` It clipped at ${d.clipped.map(fmt).join(', ')}: the level was too high there.` : '')
+      + (d.lost?.length ? ` The sound system lost sound at ${d.lost.map(fmt).join(', ')}: the master has gaps there.` : '') : `Nothing was recorded: ${why}.`,
+      !d.file || d.clipped?.length > 0 || d.lost?.length > 0);
+    if (d.file) { $('#sidename').value = nextSide(d.side); library(); }
+  } else if (!rec.on && rec.error && !rec.last) recSay(`The input cannot be heard: ${rec.error}`, true);
+}
+$('#rec').onclick = async () => {
+  recInputs = await fetch('/api/inputs').then(r => r.json()).catch(() => []);
+  $('#input').replaceChildren(...recInputs.map(i => h('option', { value: i.name, textContent: `${i.name} (${i.channels} in)` })));
+  if (recInputs.some(i => i.name === localStorage.recInput)) $('#input').value = localStorage.recInput;
+  recChannels();
+  recOutputs = await fetch('/api/outputs').then(r => r.json()).catch(() => []);
+  $('#monrow').hidden = !recOutputs.length;
+  $('#monout').replaceChildren(...recOutputs.map(o => h('option', { value: o.name, textContent: `${o.name} (${o.channels} out)` })));
+  $('#monout').value = (recOutputs.find(o => o.name === localStorage.monOut) || recOutputs.find(o => o.usual) || recOutputs[0])?.name ?? '';
+  $('#monhear').value = localStorage.monHear || 'both';
+  $('#mon').checked = false;  // never on by itself: sound should not start because a panel was opened
+  monChannels();
+  $('#stoplevel').value = localStorage.recStop ?? -101;
+  $('#target').value = localStorage.recTarget ?? -6;
+  recTold = null; sure = 0;
+  recLevels();
+  $('#recorder').showModal();
+  await recListen();
+  recTimer = setInterval(recTick, 120);
+};
+$('#input').onchange = async () => { recChannels(); await recListen(); if ($('#mon').checked) monitorSet(); };
+$('#chl').onchange = $('#chr').onchange = async () => { await recListen(); if ($('#mon').checked) monitorSet(); };
+$('#stoplevel').oninput = () => {
+  localStorage.recStop = $('#stoplevel').value;
+  recLevels();
+  if (going() && stopSet() != null) recCall('PATCH', { below: stopSet() });  // moved while a side runs: it counts from now
+};
+$('#target').oninput = () => { localStorage.recTarget = $('#target').value; recLevels(); };
+$('#mreset').onclick = () => recCall('PATCH', { forget: true });
+async function recStart(replace) {
+  const { ok, d } = await recCall('POST', { tape: $('#tapename').value, side: $('#sidename').value, below: stopSet(), replace });
+  if (ok) return;
+  recSay(d?.error || 'That did not work. Is Transclip still running?', true);
+  // Recording a side again is allowed, once it has been said: the old master goes to the bin.
+  if (d?.exists) $('#recnote').append(' ', h('button', { type: 'button', textContent: 'Record it again, and put the old one in the bin', onclick: () => recStart(true) }));
+}
+$('#recgo').onclick = () => {
+  if (!going()) return recStart(false);
+  // A side in full flow is not stopped by one stray press. Armed, or with the deck already stopped, once is enough.
+  if (rec.state === 'playing' && rec.stopped < 3 && Date.now() > sure) return void (sure = Date.now() + 4000);
+  sure = 0;
+  recCall('DELETE');
+};
+$('#recclose').onclick = () => $('#recorder').close();
+$('#recorder').addEventListener('cancel', e => { if (going()) e.preventDefault(); });  // Esc does not walk away from a side
+$('#recorder').addEventListener('close', () => { clearInterval(recTimer); recCall('DELETE', null, '?all'); });
+fetch('/api/inputs').then(r => r.json()).then(list => { $('#rec').hidden = !list.length; }).catch(() => {});
+
 // While a job runs or the panel is open, keep the picture current.
 setInterval(() => { if (lib?.job.running || $('#library').open) library(); }, 2000);
 
 document.addEventListener('keydown', e => {
-  if (!tape || $('#library').open || e.metaKey || e.ctrlKey || e.altKey || e.target.matches('input:not([type=range]), select, textarea')) return;
+  if (!tape || $('#library').open || $('#recorder').open || e.metaKey || e.ctrlKey || e.altKey || e.target.matches('input:not([type=range]), select, textarea')) return;
   const t = audio.currentTime;
   if (e.key === ' ') { e.preventDefault(); toggle(); }
   else if (e.key === 'Enter') clipFromSelection();

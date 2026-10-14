@@ -3,6 +3,7 @@
 # dependencies = [
 #   "flask>=3", "fastembed>=0.9", "imageio-ffmpeg>=0.6", "numpy",
 #   "pywebview>=6; sys_platform == 'darwin'",
+#   "sounddevice>=0.5; sys_platform == 'darwin'",
 # ]
 # ///
 """Transclip:  uv run app.py
@@ -15,7 +16,9 @@ Everything it keeps is in one folder, Transclip in your home folder (TRANSCLIP_H
 moves it): tapes/ holds each recording's transcript, listening copy and waveform
 outline, selects.json the clips, exports/ what you export. A session is another such
 folder inside it, in sessions/: one project's recordings, clips and search, apart
-from every other's. Recordings can be collected into one file for someone else and
+from every other's. On a Mac a tape can be recorded straight into a session's recordings
+folder: `app.py --record` is the program that listens to the sound input, started and
+stopped by the app. Recordings can be collected into one file for someone else and
 imported from one; originals that arrive that way are kept in originals/. Exports are
 cut from the original recordings, which are only ever read. Corrections to a transcript are kept
 beside it in <tape>.fixes and laid over the machine's words when it is read; the
@@ -24,11 +27,14 @@ model kept in models/. Nothing is sent anywhere, and only this computer can reac
 """
 import csv
 import json
+import math
 import os
 import posixpath
+import queue
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -74,6 +80,20 @@ RATE, FRAME, HOP, PER_BLOCK = 16000, 1024, 512, 8
 BLOCKS = RATE / HOP / PER_BLOCK  # measurements a second
 FLAT, CHANGE = 0.1, 0.15
 SMOOTH, BRIDGE, SHORTEST = 5, 3, 10  # seconds: judged over, a lapse a piece may contain, and the least that counts
+# Recording a tape. The master is what came in, as 24-bit stereo at 48 kHz, judged a tenth of a second at a time.
+REC_RATE, REC_BYTES = 48000, 6  # frames a second, and bytes to a frame: two channels of three
+REC_BLOCK = REC_RATE // 10 * REC_BYTES  # bytes in a tenth of a second
+# A deck that has stopped is far quieter than blank tape still running: about 45 dB on the chain this was built
+# against (-117 dBFS stopped, -72 running). The level under which the deck counts as stopped is either set by
+# the person, or learned between Record and the tape starting:
+STOPPED_ABOVE, STARTED_ABOVE = 10, 15  # dB over the learned level: still stopped, and certainly playing
+# ponytail: one fixed level stands guard over the learning. A lead-in louder than this is taken for a tape already
+# running, and the side is then never ended automatically. With the gain set very low, running tape could slip
+# under it; setting the stop level by hand is the way round that.
+QUIET_ENOUGH = -80  # dBFS
+SIDE_ENDS, LEAD_IN, TAIL = 30, 1, 3  # seconds: stopped this long is the end; kept before the tape's first sound, and after its last
+STEADY = 5  # tenths of a second that sound must last to be the tape starting, and not a click
+TEST_INPUT = os.environ.get("TRANSCLIP_TEST_INPUT")  # a sound file to stand in for the sound inputs: for tests
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -223,6 +243,271 @@ def shown(tape_id):
         np.save(part, sound(np.frombuffer(heard.stdout, np.float32)))
         os.replace(part, kept)
     return {**d, "music": music(np.load(kept), [w for c in d["chunks"] for w in c["words"]])}
+
+
+def measure(block):
+    """A stretch of 24-bit stereo sound: its level over both channels, each channel's peak (all in dBFS),
+    and whether it clipped."""
+    import numpy as np
+    b = np.frombuffer(block, np.uint8).reshape(-1, 2, 3).astype(np.int32)
+    v = b[..., 0] | b[..., 1] << 8 | (b[..., 2] ^ 0x80) - 0x80 << 16  # three bytes to a number, the top one carrying the sign
+    peak = np.abs(v).max(0)
+    db = lambda x: round(20 * math.log10(max(float(x), 0.5) / 2 ** 23), 1)
+    return db(math.sqrt(float((v.astype(np.float64) ** 2).mean()))), db(peak[0]), db(peak[1]), bool(peak.max() >= 2 ** 23 - 1)
+
+
+class Side:
+    """One side of a tape as it comes in, a tenth of a second at a time: what of it to keep, and when it is over.
+    The master starts LEAD_IN before the tape's first sound and ends TAIL after its last. A deck stopped for
+    less than SIDE_ENDS is kept whole; stopped for that long, the side has ended."""
+
+    def __init__(self, below=None):
+        self.state = "waiting"  # for the tape to start; then "playing", then "over"
+        self.below = below      # the level under which the deck counts as stopped, if the person has set one
+        self.floor = None       # otherwise the level of the stopped deck, once learned; False if the lead-in was no stopped deck
+        self.before = []        # the lead-in as (level, sound, clipped): all of it until the floor is known, then the last LEAD_IN
+        self.held = []          # sound at the stopped level, kept back until it is known whether the side has ended
+        self.kept = 0           # tenths of a second in the master so far
+        self.clipped = []       # where in the master the sound clipped, in seconds, at most once a second
+
+    def hear(self, block, measured=None):
+        """Take in the next tenth of a second. Returns what belongs in the master now, which may be nothing."""
+        level, _, _, clipped = measured or measure(block)
+        if self.state == "over":
+            return b""
+        if self.state == "waiting":
+            self.before.append((level, block, clipped))
+            if self.below is None and self.floor is None:
+                if len(self.before) < LEAD_IN * 10:
+                    return b""
+                low = sorted(l for l, *_ in self.before)[len(self.before) // 5]  # near the quietest, a stray click aside
+                self.floor = low if low <= QUIET_ENOUGH else False
+            if self.stops_below is None:  # the tape was already running: keep it all, and leave the stopping to the person
+                return self.start(0)
+            playing = self.below if self.below is not None else self.floor + STARTED_ABOVE
+            quiet = [l <= playing for l, *_ in reversed(self.before)]
+            lasted = quiet.index(True) if True in quiet else len(quiet)  # how long there has now been sound
+            if lasted < STEADY:
+                del self.before[:-(LEAD_IN * 10 + STEADY)]
+                return b""
+            return self.start(max(len(self.before) - lasted - LEAD_IN * 10, 0))
+        if self.stops_below is not None and level <= self.stops_below:
+            self.held.append(block)
+            return self.stop() if len(self.held) >= SIDE_ENDS * 10 else b""
+        back, self.held = self.held, []  # sound again: the deck had only paused
+        return self.keep([(b, False) for b in back] + [(block, clipped)])
+
+    @property
+    def stops_below(self):
+        """The level under which the deck counts as stopped: set, or learned. None while that is not known, or never will be."""
+        return self.below if self.below is not None else self.floor + STOPPED_ABOVE if self.floor else None
+
+    def start(self, at):
+        self.state, lead, self.before = "playing", self.before[at:], []
+        return self.keep([(b, c) for _, b, c in lead])
+
+    def keep(self, blocks):
+        for _, clipped in blocks:
+            if clipped and (not self.clipped or self.kept / 10 - self.clipped[-1] >= 1):
+                self.clipped.append(self.kept / 10)
+            self.kept += 1
+        return b"".join(b for b, _ in blocks)
+
+    def stop(self):
+        """End the side. Returns the last of what belongs in the master: at most TAIL of the stopped deck."""
+        self.state, tail, self.held = "over", self.held[:TAIL * 10], []
+        return self.keep([(b, False) for b in tail])
+
+
+class Master:
+    """A WAV file being written. Its header is brought up to date as it grows, so that whatever happens
+    the file on disk is one that plays as far as it had got."""
+
+    def __init__(self, path):
+        self.f, self.size = open(path, "xb"), 0  # never over a file that is already there
+        self.f.write(self.head())
+
+    def head(self):
+        return struct.pack("<4sI4s4sIHHIIHH4sI", b"RIFF", 36 + self.size, b"WAVE", b"fmt ", 16, 1, 2, REC_RATE,
+                           REC_RATE * REC_BYTES, REC_BYTES, 24, b"data", self.size)
+
+    def write(self, sound):
+        self.f.write(sound)
+        self.size += len(sound)
+
+    def settle(self):
+        self.f.seek(0)
+        self.f.write(self.head())
+        self.f.seek(0, 2)
+        self.f.flush()
+        os.fsync(self.f.fileno())
+
+
+def recorder(spec):
+    """`app.py --record <json>`: the program that listens to a sound input. The app starts it, gives it orders one
+    to a line on its standard input ({"record": path}, {"stop": true}), and ends it by closing that. It answers one
+    JSON object to a line: the level ten times a second, and {"done": ...} when a side is finished.
+    It is a program of its own so that nothing the app is busy with can hold up the sound."""
+    def say(**message):
+        try:
+            print(json.dumps(message), flush=True)
+        except OSError:
+            pass  # the app has gone: the side is still finished properly
+
+    # Everything is loaded before a thread starts waiting on standard input: on Windows, loading numpy
+    # while another thread waits on that pipe never finishes.
+    import wave
+    import numpy as np
+    if not spec.get("file"):
+        import sounddevice as sd
+    orders = queue.Queue()
+
+    def listen_for_orders():
+        for line in sys.stdin:
+            orders.put(json.loads(line))
+        orders.put(None)  # the app closed the panel, or is no longer there
+    threading.Thread(target=listen_for_orders, daemon=True).start()
+    if spec.get("file"):
+        # Tests: a WAV at 48 kHz stands in for an input. It would be over before Record was pressed, so it waits for that.
+        orders.put(orders.get())
+        played = wave.open(spec["file"])
+        width, count = played.getsampwidth(), played.getnchannels()
+
+        def incoming():
+            raw = np.frombuffer(played.readframes(REC_RATE // 10), np.uint8).reshape(-1, count, width).astype(np.int32)
+            v = (raw[..., -1] ^ 0x80) - 0x80  # the top byte carries the sign; whatever the depth, made 24-bit
+            for i in range(2, width + 1):
+                v = v << 8 | raw[..., -i]
+            v = v << 8 * (3 - width) if width < 3 else v >> 8 * (width - 3)
+            return np.ascontiguousarray(v[:, [int(spec["left"]), int(spec["right"])]], "<i4").view(np.uint8).reshape(-1, 4)[:, :3].tobytes(), False
+    else:
+        # The sound system hands over every buffer by calling arrived(), and they wait in a queue until taken:
+        # nothing is skipped because this program was busy. (ffmpeg's own Mac input keeps only the newest buffer,
+        # and on the interface this was built with it lost one in nine.) If the sound system itself ever has to
+        # throw sound away it says so, and so does a jump in the buffers' own clock: either way the side is told.
+        waiting, clock = queue.Queue(), {"next": None}
+
+        def arrived(data, frames, when, status):
+            late = clock["next"] is not None and when.inputBufferAdcTime - clock["next"] > 0.02
+            clock["next"] = when.inputBufferAdcTime + frames / REC_RATE
+            waiting.put((bytes(data), bool(status.input_overflow) or late))
+        device = next(i for i, d in enumerate(sd.query_devices()) if d["name"] == spec["device"] and d["max_input_channels"])
+        stream = sd.RawInputStream(device=device, samplerate=REC_RATE, channels=2, dtype="int24", blocksize=REC_RATE // 10, dither_off=True,
+                                   extra_settings=sd.CoreAudioSettings(channel_map=[int(spec["left"]), int(spec["right"])]), callback=arrived)
+        stream.start()
+
+        def incoming():
+            try:
+                return waiting.get(timeout=5)
+            except queue.Empty:  # unplugged, or switched off
+                return b"", False
+    side = master = path = None
+
+    def finish(why):
+        """Close the side being kept, give it its name, and say what became of it."""
+        nonlocal side, master
+        done = {"why": why, "file": None, "seconds": side.kept / 10, "auto": side.stops_below is not None, "lost": lost}
+        try:
+            last = side.stop() if side.state != "over" else b""
+            if master:
+                master.write(last)
+                done.update(seconds=side.kept / 10, clipped=side.clipped)
+                master.settle()
+                master.f.close()
+                final, n = Path(path), 1
+                while final.exists():  # the app looked before starting; this is for a file that turned up since
+                    n += 1
+                    final = Path(path).with_name(f"{Path(path).stem} ({n}).wav")
+                os.replace(path + ".part", final)
+                done["file"] = str(final)
+        except OSError as e:
+            done["why"] = f"{why}; and the file could not be finished: {e}. What was recorded is in {path}.part"
+        side = master = None
+        say(done=done)
+
+    kept_at_last_settle = 0
+    top, quietest = [-200.0, -200.0], 0.0  # the loudest each channel has been and the quietest the input has been, since asked to forget
+    lost = []  # where in the side being kept the sound system lost sound, in seconds
+    while True:
+        block, gap = incoming()  # waits until a tenth of a second has come in
+        closing = False
+        while not orders.empty():
+            order = orders.get()
+            if order is None:
+                closing = True
+            elif order.get("record") and not side:
+                path, side, kept_at_last_settle, lost = order["record"], Side(order.get("below")), 0, []
+            elif order.get("stop") and side:
+                finish("stopped")
+            elif order.get("forget"):
+                top, quietest = [-200.0, -200.0], 0.0
+            elif "below" in order and side and order["below"] is not None:  # the stop level, moved while the side runs
+                side.below = order["below"]
+        if len(block) < REC_BLOCK:  # the input has gone: unplugged, refused, or a test's file at its end
+            if side:
+                finish("the input stopped")
+            say(error="The sound input stopped. Is it still plugged in and switched on?")
+            break
+        if gap and side and side.state == "playing":
+            lost.append(side.kept / 10)
+        level, left, right, clipped = measure(block)
+        top, quietest = [max(top[0], left), max(top[1], right)], min(quietest, level)
+        if side:
+            try:
+                sound = side.hear(block, (level, left, right, clipped))
+                if sound:
+                    master = master or Master(path + ".part")
+                    master.write(sound)
+                    if side.kept - kept_at_last_settle >= 20:
+                        master.settle()
+                        kept_at_last_settle = side.kept
+            except OSError as e:  # the disk is full, or has gone
+                finish(f"it could not be written: {e}")
+        if side and side.state == "over":
+            finish("the side ended")
+        learning = bool(side) and side.below is None and side.floor is None
+        say(l=left, r=right, clip=clipped, level=level, top=top, quietest=quietest, state=side.state if side else "listening",
+            seconds=side.kept / 10 if side else 0, stopped=len(side.held) / 10 if side else 0,
+            below=side.stops_below if side else None, auto=None if not side or learning else side.stops_below is not None, lost=len(lost))
+        if closing:
+            if side:
+                finish("Transclip was closed")
+            break
+
+
+def ears(hear):
+    """Which of the two channels coming in goes to the left ear and which to the right: both as they are,
+    or one of them in both ears, for a tape recorded on one track."""
+    return {"left": [0, 0], "right": [1, 1]}.get(hear, [0, 1])
+
+
+def to_outputs(count, left, right):
+    """For a device with `count` outputs: what each one is sent. 0 is the left of what is heard, 1 the right, -1 nothing."""
+    sent = [-1] * count
+    sent[left], sent[right] = 0, 1
+    return sent
+
+
+def monitor(spec):
+    """`app.py --monitor <json>`: plays a sound input straight through to an output, so that a tape can be heard.
+    It runs until its standard input is closed. It is a program of its own and takes no part in recording:
+    whatever becomes of it, the master is not touched."""
+    import sounddevice as sd
+    try:
+        all_of_them = sd.query_devices()
+        find = lambda name, kind: next(i for i, d in enumerate(all_of_them) if d["name"] == name and d[kind])
+        coming, going = find(spec["input"], "max_input_channels"), find(spec["output"], "max_output_channels")
+        route = ears(spec.get("hear"))
+
+        def through(indata, outdata, frames, when, status):
+            outdata[:] = indata[:, route]
+        wiring = (sd.CoreAudioSettings(channel_map=[int(spec["left"]), int(spec["right"])]),
+                  sd.CoreAudioSettings(channel_map=to_outputs(all_of_them[going]["max_output_channels"], int(spec["out_left"]), int(spec["out_right"]))))
+        with sd.Stream(device=(coming, going), samplerate=REC_RATE, channels=2, dtype="float32", latency="low", extra_settings=wiring, callback=through):
+            print(json.dumps({"on": True}), flush=True)
+            sys.stdin.read()
+    except Exception as e:  # no such device any more, or one that will not open: said, not thrown
+        print(json.dumps({"error": str(e) or type(e).__name__}), flush=True)
 
 
 def norm(word):
@@ -567,8 +852,13 @@ def start_job(folder, todo):
             state.update({k: said[k] for k in ("i", "n", "file", "fraction", "note") if k in said})
         if proc.wait() == 0 and state["running"]:
             state["note"] = "Finished." if not state["failed"] else f"Finished, but {len(state['failed'])} could not be read."
+            waiting = [r for f, r in _queue if f == folder]  # sides recorded while this was going on
+            del _queue[:]
+            if waiting:
+                return start_job(folder, waiting)
         elif state["running"]:
             state["note"] = "The transcriber stopped: " + state["note"]
+        del _queue[:]  # stopped or failed: they are not lost, only left "to do" like any other recording
         state["running"] = False
 
     threading.Thread(target=watch, daemon=True).start()
@@ -580,6 +870,123 @@ def stop_job():
         state.update(running=False, note="Stopped. Recordings already finished are kept.")
         proc.stdin.close()
         proc.terminate()  # in case it had not got as far as listening
+
+
+_rec = {"proc": None, "state": {"on": False}}  # the program listening to a sound input, and the last it said
+_queue = []  # sides recorded while the transcriber was busy, as (folder, recording)
+
+
+def recording():
+    return _rec["state"].get("state") in ("waiting", "playing")
+
+
+def inputs(way="input"):
+    """The sound inputs this computer has (or with "output", its outputs): each one's name, how many channels it
+    offers, the rate it is running at, and whether it is the one the system uses unless told otherwise."""
+    if TEST_INPUT:
+        return [{"name": "Test input", "channels": 2, "rate": REC_RATE, "usual": True}] if way == "input" else []
+    if sys.platform != "darwin":
+        return []  # ponytail: recording is built on the Mac's sound system. PortAudio speaks to Windows' and Linux's too, when wanted.
+    told = json.loads(subprocess.run(["system_profiler", "SPAudioDataType", "-json"], capture_output=True, text=True).stdout or "{}")
+    return [{"name": d["_name"], "channels": int(d[f"coreaudio_device_{way}"]), "rate": int(d.get("coreaudio_device_srate") or 0),
+             "usual": f"coreaudio_default_audio_{way}_device" in d}
+            for d in told.get("SPAudioDataType", [{}])[0].get("_items", []) if d.get(f"coreaudio_device_{way}")]
+
+
+_mon = {"proc": None, "state": {"on": False}}  # the program playing the input through to an output, and what it last said
+
+
+def unmonitor():
+    proc, _mon["proc"] = _mon["proc"], None
+    if proc and proc.poll() is None:
+        proc.stdin.close()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+
+
+def hush():
+    """Stop listening, and stop playing the input through. A side being recorded is finished properly first."""
+    unmonitor()
+    proc, _rec["proc"] = _rec["proc"], None
+    if proc and proc.poll() is None:
+        proc.stdin.close()
+        try:
+            proc.wait(15)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+
+
+def listen(device, left, right):
+    """Start listening to an input, for the meter and ready to record from."""
+    hush()
+    spec = {"file": TEST_INPUT} if TEST_INPUT else {"device": device}
+    proc = subprocess.Popen([sys.executable, str(ROOT / "app.py"), "--record", json.dumps({**spec, "left": left, "right": right})],
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    state = {"on": True, "device": device, "left": left, "right": right, "state": "listening", "last": None}
+    _rec.update(proc=proc, state=state)
+
+    def watch():
+        for line in proc.stdout:
+            try:
+                said = json.loads(line)
+            except ValueError:
+                said = None
+            if not isinstance(said, dict):  # not its own voice: the sound system's, or a crash
+                state["complaint"] = line.strip()[-300:] or state.get("complaint")
+                continue
+            if "done" not in said:
+                state.update(said)
+                continue
+            state.update(last={**said["done"], "tape": state.get("tape"), "side": state.get("side")}, state="listening", seconds=0, stopped=0)
+            if said["done"]["file"]:  # transcribed at once, or as soon as the transcriber is free
+                folder, rel = Path(state["folder"]), Path(said["done"]["file"]).relative_to(state["folder"]).as_posix()
+                try:
+                    _queue.append((folder, rel)) if _job["state"]["running"] else start_job(folder, [rel])
+                except Exception:
+                    pass  # the sound is safe, and the side is "to do" like any other recording
+        if proc is _rec["proc"]:  # it stopped without being told to: say what it said last
+            state.setdefault("error", state.get("complaint") or "The program that listens to the input stopped.")
+        state["on"] = False
+    threading.Thread(target=watch, daemon=True).start()
+
+
+def tell(order):
+    """Give the listening program an order."""
+    _rec["proc"].stdin.write(json.dumps(order) + "\n")
+    _rec["proc"].stdin.flush()
+
+
+def level(given):
+    """A stop level as the page sends it: a number of dBFS, kept within reason, or None for "learn it"."""
+    return None if given is None else max(-120.0, min(float(given), -20.0))
+
+
+def bin_it(path):
+    """Put a file in the system's bin, where it can be had back; or where there is no bin to be had, set it aside
+    under a name the app does not take for a recording."""
+    try:
+        from Foundation import NSURL, NSFileManager
+        if not TEST_INPUT and NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(NSURL.fileURLWithPath_(str(path)), None, None)[0]:
+            return  # (a test's leavings are kept out of the person's bin)
+    except ImportError:
+        pass
+    os.replace(path, path.with_name(path.name + time.strftime(".replaced %Y-%m-%d %H.%M.%S")))
+
+
+def rescue():
+    """Give a recording that was cut short (a crash, the power) its name. It is whole as far as it got."""
+    folder, saved = pending()[0], []
+    for part in sorted(folder.glob("*/*.wav.part")) if folder else []:
+        final, size = part.with_suffix(""), (part.stat().st_size - 44) // REC_BYTES * REC_BYTES
+        if size <= 0 or final.exists():
+            continue
+        with open(part, "r+b") as f:  # its header may be a couple of seconds behind
+            f.seek(4), f.write(struct.pack("<I", 36 + size)), f.seek(40), f.write(struct.pack("<I", size))
+        os.replace(part, final)
+        saved.append(final.relative_to(folder).as_posix())
+    return saved
 
 
 def status():
@@ -597,10 +1004,10 @@ def window(webview, url):
     # Words are selected by dragging across them, which a window does not allow unless told to.
     w = webview.create_window("Transclip", url, width=1440, height=900, min_size=(900, 560), text_select=True)
     # Closing the window quits, and quitting stops the transcriber: ask first while it is at work.
-    w.events.closing += lambda: setattr(w, "confirm_close", _job["state"]["running"])
+    w.events.closing += lambda: setattr(w, "confirm_close", _job["state"]["running"] or recording())
     webview.start(private_mode=False,  # a private window would forget which recording was open
-                  localization={"global.quitConfirmation": "A transcription is still running. Quitting stops it; "
-                                "recordings already finished are kept."})
+                  localization={"global.quitConfirmation": "A recording or a transcription is still running. Quitting stops it; "
+                                "what is already recorded or transcribed is kept."})
 
 
 def pick(what, prompt):
@@ -674,6 +1081,8 @@ def get_library():
 @app.put("/api/library")
 def put_library():
     body = request.get_json()
+    if recording():
+        return jsonify({"error": "A side is being recorded into this folder."}), 409
     try:
         depth = max(0, min(int(body.get("depth", 3)), 20))
     except (TypeError, ValueError):
@@ -685,8 +1094,8 @@ def put_library():
 @app.put("/api/session")
 def put_session():
     """Open the session of that name, making it if there is none; with no name, the first library."""
-    if _job["state"]["running"]:
-        return jsonify({"error": "Stop the transcription before changing session: it belongs to this one."}), 409
+    if _job["state"]["running"] or recording():
+        return jsonify({"error": "Stop the transcription or the recording before changing session: it belongs to this one."}), 409
     name = str(request.get_json().get("name") or "").strip()
     open_session(safe(name) if name else "")
     return jsonify(status())
@@ -695,6 +1104,134 @@ def put_session():
 @app.post("/api/choose-folder")
 def choose():
     return jsonify({"folder": pick("folder", "The folder containing your recordings")})
+
+
+@app.get("/api/inputs")
+def get_inputs():
+    return jsonify(inputs())
+
+
+@app.get("/api/outputs")
+def get_outputs():
+    return jsonify(inputs("output"))
+
+
+@app.put("/api/monitor")
+def monitor_start():
+    """Play an input straight through to an output: {"input", "left", "right", "output", "out_left", "out_right", "hear"}.
+    Apart from the recorder, so it can be started and stopped while a side is being recorded."""
+    body = request.get_json()
+    coming = next((d for d in inputs() if d["name"] == body.get("input")), None)
+    going = next((d for d in inputs("output") if d["name"] == body.get("output")), None)
+    if not coming or not going:
+        return jsonify({"error": "That input or output is not there. Is it plugged in?"}), 409
+    try:
+        spec = {"input": coming["name"], "output": going["name"], "hear": str(body.get("hear") or "both"),
+                **{k: min(max(int(body.get(k, i % 2)), 0), (coming if i < 2 else going)["channels"] - 1)
+                   for i, k in enumerate(("left", "right", "out_left", "out_right"))}}
+    except (TypeError, ValueError):
+        abort(400, "the channels must be numbers")
+    unmonitor()
+    proc = subprocess.Popen([sys.executable, str(ROOT / "app.py"), "--monitor", json.dumps(spec)], stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    state = {**spec, "on": True}
+    _mon.update(proc=proc, state=state)
+
+    def watch():
+        for line in proc.stdout:
+            try:
+                state.update(json.loads(line))
+            except ValueError:
+                state["complaint"] = line.strip()[-300:]
+        if proc is _mon["proc"]:  # it stopped without being told to
+            state.setdefault("error", state.get("complaint") or "The program that plays the input through stopped.")
+        state["on"] = False
+    threading.Thread(target=watch, daemon=True).start()
+    return jsonify(state)
+
+
+@app.delete("/api/monitor")
+def monitor_stop():
+    unmonitor()
+    return jsonify({"on": False})
+
+
+@app.get("/api/monitor")
+def monitor_state():
+    return jsonify(_mon["state"])
+
+
+@app.get("/api/record")
+def record_state():
+    return jsonify(_rec["state"])
+
+
+@app.put("/api/record")
+def record_listen():
+    """Listen to a sound input: for the meter, and ready to record from. Also says which recordings,
+    cut short earlier, have just been given their names."""
+    body = request.get_json()
+    device = next((d for d in inputs() if d["name"] == body.get("device")), None)
+    if recording() or not device:
+        return jsonify({"error": "A side is being recorded." if recording() else "That input is not there. Is it plugged in?"}), 409
+    try:
+        left, right = (min(max(int(body.get(k, i)), 0), device["channels"] - 1) for i, k in enumerate(("left", "right")))
+    except (TypeError, ValueError):
+        abort(400, "left and right must be channel numbers")
+    saved = rescue()
+    listen(device["name"], left, right)
+    return jsonify({**_rec["state"], "rate": device["rate"], "rescued": saved})
+
+
+@app.post("/api/record")
+def record_start():
+    """Record a side from the input being listened to, as <recordings folder>/<tape>/<side>.wav."""
+    body = request.get_json()
+    tape, side = (safe(name) if (name := str(body.get(k) or "").strip()) else "" for k in ("tape", "side"))
+    folder = pending()[0]
+    path = folder / tape / (side + ".wav") if folder and tape and side else None
+    there = [f for f in path.parent.iterdir() if f.name == path.name + ".part" or (f.stem == side and f.suffix.lower() in AUDIO)
+             ] if path and path.parent.is_dir() else []
+    kept = [f for ext in (".json", ".fixes", ".m4a", ".peaks", ".emb.npy", ".sound.npy") if path and (f := TAPES / tape / (side + ext)).exists()]
+    taken = bool(there or kept) and not body.get("replace")
+    problem = ("Open the Record panel, so the input is being listened to." if not _rec["state"]["on"] or not _rec["proc"]
+               else "A side is already being recorded." if recording()
+               else "Give the tape and the side each a name." if not (tape and side)
+               else "Choose this session's recordings folder first, in Recordings…: the master is written there." if not folder
+               else "The recordings folder cannot be written to." if not os.access(folder, os.W_OK)
+               else f"There is already a recording called {tape} / {side}." if taken
+               else "There is not room on that disk for two hours of recording (2 GB)." if shutil.disk_usage(folder).free < 2e9
+               else None)
+    if problem:
+        return jsonify({"error": problem, "exists": problem.startswith("There is already")}), 409
+    for f in there:  # recorded again: the old master goes to the bin, not out of existence
+        bin_it(f)
+    for f in kept:   # what the app made from it is of no more use
+        f.unlink()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rec["state"].update(folder=str(folder), tape=tape, side=side, last=None, state="waiting", seconds=0, stopped=0, auto=None)
+    tell({"record": str(path), "below": level(body.get("below"))})
+    return jsonify(_rec["state"])
+
+
+@app.patch("/api/record")
+def record_adjust():
+    """While listening: move the stop level of the side being recorded ({"below": dBFS}), or forget the loudest and
+    quietest heard so far ({"forget": true})."""
+    body = request.get_json()
+    if _rec["state"]["on"] and _rec["proc"]:
+        tell({"forget": True} if body.get("forget") else {"below": level(body.get("below"))})
+    return jsonify(_rec["state"])
+
+
+@app.delete("/api/record")
+def record_stop():
+    """Stop the side being recorded, and go on listening; with ?all, stop listening too (the panel was closed)."""
+    if request.args.get("all") is not None:
+        hush()
+    elif recording():
+        tell({"stop": True})
+    return jsonify(_rec["state"])
 
 
 @app.post("/api/share")
@@ -890,6 +1427,74 @@ def export():
 
 
 def check():
+    # Recording. Sound made to order: a tenth of a second of noise at a level, different every time.
+    import tempfile
+    import wave
+    import numpy as np
+    rng = np.random.default_rng(1)
+    as_bytes = lambda v: np.asarray(v, "<i4").view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
+    noise = lambda db: as_bytes(rng.normal(0, 2 ** 23 * 10 ** (db / 20), REC_BLOCK // 3).clip(-2 ** 23, 2 ** 23 - 1).astype(np.int64))
+    level, left, right, clipped = measure(as_bytes([2 ** 22, -2 ** 23] * 4800))  # left at half scale, right hard against the bottom
+    assert (level, left, right, clipped) == (-2.0, -6.0, 0.0, True), (level, left, right, clipped)
+    assert measure(noise(-60))[0] == -60.0 and measure(bytes(REC_BLOCK))[:3] == (-144.5,) * 3
+
+    # Hearing a tape: as recorded, or one track in both ears; and which of an interface's outputs it is sent to.
+    assert (ears("both"), ears("left"), ears("right"), ears(None)) == ([0, 1], [0, 0], [1, 1], [0, 1])
+    assert to_outputs(6, 2, 3) == [-1, -1, 0, 1, -1, -1] and to_outputs(2, 0, 1) == [0, 1] and to_outputs(2, 1, 1) == [-1, 1]
+
+    # A side as it should go: Record, the deck still stopped; Play; a ten-second pause; on to the end, where the deck stops.
+    tape = lambda seconds: [noise(-72 if i % 3 else -25) for i in range(seconds * 10)]  # speech over the hiss of a running tape
+    stopped = lambda seconds: [noise(-117) for _ in range(seconds * 10)]
+    parts = [stopped(2) + [noise(-100)] + stopped(2), tape(20), stopped(10), tape(5), stopped(40)]  # a click in the lead-in is not the tape
+    came, side, got = sum(parts, []), Side(), []
+    for block in came:
+        got.append(side.hear(block))
+        if side.state == "over":
+            break
+    start, end = 41, 41 + 350
+    assert side.floor < -110 and -108 < side.stops_below < -106 and side.state == "over" and len(got) == end + SIDE_ENDS * 10, (side.floor, len(got))
+    assert b"".join(got) == b"".join(came[start - LEAD_IN * 10:end + TAIL * 10]), "the master is not the tape, a second before to three after"
+    assert side.kept == 10 + 350 + 30 and not side.clipped and not any(got[:start]), side.kept
+    # The tape already running when Record was pressed: all of it is kept, and it never ends by itself.
+    side = Side()
+    came = tape(3) + stopped(60)
+    assert b"".join(side.hear(b) for b in came) == b"".join(came) and (side.floor, side.stops_below, side.state) == (False, None, "playing")
+    assert side.stop() == b"" and side.state == "over"
+    # With the stop level set by hand nothing is learned, so the same side does end by itself, three seconds after the tape.
+    side = Side(-90)
+    assert b"".join(side.hear(b) for b in came) == b"".join(came[:30 + TAIL * 10]) and (side.floor, side.state) == (None, "over")
+    # Set above the hiss of the tape it would take a quiet stretch for the end; moved down while the side runs, it no longer does.
+    side, came = Side(-60), stopped(2) + [noise(-25) for _ in range(40)] + [noise(-72) for _ in range(400)] + tape(1)
+    got = [side.hear(b) for b in came[:359]]
+    assert len(side.held) == 299 and side.state == "playing"  # a breath from ending the side on hiss
+    side.below = -90
+    assert b"".join(got + [side.hear(b) for b in came[359:]]) == b"".join(came[10:]) and side.state == "playing"
+    # Stopped by hand: within the lead-in there is nothing to keep; after the deck has stopped, three seconds of it.
+    side = Side()
+    assert not any(side.hear(b) for b in stopped(5)) and side.stop() == b"" and side.kept == 0
+    side, came = Side(), stopped(2) + tape(2) + stopped(8)
+    assert b"".join([side.hear(b) for b in came] + [side.stop()]) == b"".join(came[10:40 + TAIL * 10])
+    # Clipping is noted where it falls in the master, once a second at most.
+    side, loud = Side(), as_bytes([2 ** 23 - 1, 0] * 4800)
+    for block in stopped(2) + tape(1) + [loud, loud] + tape(2) + [loud]:
+        side.hear(block)
+    assert side.clipped == [2.0, 4.2], side.clipped
+    # The file plays as far as it has got, whenever it is looked at.
+    with tempfile.TemporaryDirectory() as tmp:
+        master = Master(tmp + "/a.wav")
+        master.write(came[25] * 7), master.settle(), master.write(came[26])
+        with wave.open(tmp + "/a.wav") as w:
+            assert (w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()) == (48000, 2, 3, 7 * 4800)
+            assert w.readframes(4800) == came[25]
+        master.settle(), master.f.close()
+        with wave.open(tmp + "/a.wav") as w:
+            assert w.getnframes() == 8 * 4800
+        try:
+            Master(tmp + "/a.wav")
+            raise AssertionError("a master was written over another")
+        except FileExistsError:
+            pass
+
     # A collected file from elsewhere: what is taken from it, and what is refused.
     assert member("tapes/Proj/Tape 5.1.2/Side A.json") == ("tapes", "Proj/Tape 5.1.2/Side A", ".json")
     assert member("originals/Side A.WAV") == ("originals", "Side A", ".WAV") and member("tapes/a.m4a")
@@ -960,6 +1565,12 @@ def check():
 if __name__ == "__main__":
     if "--check" in sys.argv:
         check()
+        sys.exit()
+    if "--record" in sys.argv:
+        recorder(json.loads(sys.argv[sys.argv.index("--record") + 1]))
+        sys.exit()
+    if "--monitor" in sys.argv:
+        monitor(json.loads(sys.argv[sys.argv.index("--monitor") + 1]))
         sys.exit()
     def answering(port):
         with socket.socket() as s:

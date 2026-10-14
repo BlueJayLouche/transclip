@@ -4,6 +4,7 @@ Transcribe a folder of audio recordings, read and search them, and pull clips ou
 
 Built for making selects from an archive of digitised cassette tapes: hours of speech, uneven quality, not much time.
 
+- **Records tapes** (on a Mac): the master WAV straight from a sound input, started before the tape and ended by itself when the deck stops, then transcribed without being asked.
 - **Transcribes on your own computer.** Whisper large-v3, with a time for every word. Stretches in another language are marked and roughly translated into English; stretches with no speech are marked too.
 - **Music is marked** where there are no words: in the transcript ("♪ Music · 3 min 20 s") and as a green band on the waveform. It goes by the sound alone, so take it as a guide: a busy room with a hum in it can be taken for music, and music under speech is not marked.
 - **Transcript and waveform, linked.** Click a word to play from it. Drag across words to make a clip, drag the clip's edges on the waveform to trim it.
@@ -62,6 +63,37 @@ uv fetches Python and everything else the first time, ffmpeg included. On a Mac 
 
 Closing the window quits Transclip; while a transcription is running it asks first, because quitting stops it. Where it runs in the browser instead, starting it again just shows it, and **Recordings… → Quit Transclip** stops it.
 
+## Recording a tape
+
+On a Mac, **Record…** (beside Recordings…) transfers a tape through any sound input and makes the master: a 24-bit, 48 kHz stereo WAV in the session's recordings folder, as `<tape>/<side>.wav`.
+
+1. Choose the **input**, and for an interface with more than two inputs the **channels** the deck is on. The meter is live from then on.
+2. Play the loudest part of the tape and set the gain on your interface or deck until "loudest so far" sits near the **target max** (the orange mark, −6 dBFS unless you move it). Transclip only measures; the master is exactly what arrives.
+3. Type the **tape**'s name. The **side** starts as "Side A".
+4. With the deck stopped, press **Record** and wait for **ARMED**. Then press Play on the deck: the panel turns to **● RECORDING**.
+
+What it keeps, and when it ends:
+
+- The master begins one second before the tape's first sound, so the wait before you press Play is not in it. A click is not taken for the tape: the sound has to last.
+- The side **ends by itself** once the deck has been stopped for 30 seconds, and the master ends three seconds after the last sound. A blank stretch of tape, however long, does not end the side; a pause of the deck shorter than 30 seconds stays in the master. While it counts down the panel says **DECK STOPPED** and the button reads **End side now**.
+- **Stop** ends a side at any time. While sound is still coming it asks to be pressed twice, so a stray press does not end a transfer. **Cancel**, while armed, records nothing.
+- If the sound clipped, the panel says where. If the sound system ever lost sound, it says that too: such a master has gaps and should be done again.
+
+**The stop level** (the blue mark) is the level under which the deck counts as stopped. A deck standing still is far quieter than blank tape running, and the level has to lie between the two.
+
+- With the slider all the way left it is **learned**: from the moments between Record and the tape starting. That needs Record before Play; if the tape was already running, nothing could be learned, the side does not end by itself, and the panel says so.
+- Anywhere else, it is what you set: read the meter with the deck stopped ("quietest" shows it), read it on blank tape, and put the mark between. It can be moved while a side is recording.
+
+**Monitor** plays the input through to an output you choose, so the tape can be heard: as recorded, or with one track in both ears for a tape recorded on one. It is a separate program from the recorder and has no part in the master, so it can be switched on and off while a side is recording. It is never on unless you tick it.
+
+**Recording a side again.** A name that is taken is refused; the panel then offers to record it again, and the old master goes to the Mac's bin.
+
+When a side ends it is transcribed straight away, or as soon as a transcription already running has finished, and the panel offers the next side of the same tape. The panel keeps the window until the side is over, and the session and its recordings folder cannot be changed meanwhile.
+
+The sound comes first. The recorder is a program of its own that nothing else in the app can hold up; every buffer the sound system delivers is queued, never skipped; the file on disk is a playable WAV at every moment; quitting asks first and finishes the file; and after a crash or a power cut, what had been recorded is given its name the next time the Record panel is opened. It will not start without room for two hours on the disk.
+
+Not yet: the transcript appearing while the tape is still playing, and recording on Windows or Linux.
+
 ## Sessions
 
 A session is one project: its own recordings, its own recordings folder, its own clips and exports. Search looks through every recording of the open session and none of any other.
@@ -110,7 +142,9 @@ echo '[]' > /tmp/none.json && uv run transcribe.py /tmp/none.json && echo "The s
 
 It fetches the same model to the same place, and the app finds it there. If that stalls too, put `HF_HUB_DISABLE_XET=1 ` in front of `uv` to fetch it by the plain route.
 
-**macOS asks whether "python3.12" may read a folder.** That is Transclip (see [Install](#macos-app)). It can ask again for Downloads, Documents or Desktop when a file is imported or located there.
+**macOS asks whether "python3.12" may read a folder, or use the microphone.** That is Transclip (see [Install](#macos-app)). It can ask again for Downloads, Documents or Desktop when a file is imported or located there. "The microphone" is how macOS speaks of every sound input: it is asked the first time the Record panel is opened, and recording cannot work without it.
+
+**A side did not end by itself.** Either the tape was already running when Record was pressed (the panel said so), or the deck does not go quiet enough when it stops. Press Stop; nothing is lost. For the next side, set the stop level by hand.
 
 **Anything else:** the app's own messages are in `Library/Logs/Transclip.log` in your home folder.
 
@@ -149,4 +183,4 @@ After changing a script's dependencies: `uv lock --script app.py` (or `transcrib
 
 ## Built with
 
-[Whisper](https://github.com/openai/whisper) via [MLX](https://github.com/ml-explore/mlx-examples/tree/main/whisper) and [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Silero VAD](https://github.com/snakers4/silero-vad), [fastembed](https://github.com/qdrant/fastembed), [wavesurfer.js](https://wavesurfer.xyz), [FFmpeg](https://ffmpeg.org) through [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), [Flask](https://flask.palletsprojects.com), [pywebview](https://pywebview.flowrl.com) for the Mac window, [Pillow](https://python-pillow.org) to draw the icon, and [uv](https://docs.astral.sh/uv/), a copy of which is inside the Mac app.
+[Whisper](https://github.com/openai/whisper) via [MLX](https://github.com/ml-explore/mlx-examples/tree/main/whisper) and [faster-whisper](https://github.com/SYSTRAN/faster-whisper), [Silero VAD](https://github.com/snakers4/silero-vad), [fastembed](https://github.com/qdrant/fastembed), [wavesurfer.js](https://wavesurfer.xyz), [FFmpeg](https://ffmpeg.org) through [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg), [Flask](https://flask.palletsprojects.com), [pywebview](https://pywebview.flowrl.com) for the Mac window, [sounddevice](https://python-sounddevice.readthedocs.io) and [PortAudio](https://www.portaudio.com) for recording, [Pillow](https://python-pillow.org) to draw the icon, and [uv](https://docs.astral.sh/uv/), a copy of which is inside the Mac app.
