@@ -362,13 +362,20 @@ def recorder(spec):
         orders.put(None)  # the app closed the panel, or is no longer there
     threading.Thread(target=listen_for_orders, daemon=True).start()
     if spec.get("file"):
-        # Tests: a sound file stands in for an input. It would be over before Record was pressed, so it waits for that.
-        print(json.dumps({"test": "waiting for Record"}), flush=True)
+        # Tests: a WAV at 48 kHz stands in for an input. It would be over before Record was pressed, so it waits for that.
+        import wave
+        import numpy as np
         orders.put(orders.get())
-        print(json.dumps({"test": "playing the file"}), flush=True)
-        played = subprocess.Popen([FFMPEG, "-v", "error", "-i", spec["file"], "-af", f"pan=stereo|c0=c{int(spec['left'])}|c1=c{int(spec['right'])}",
-                                   "-ar", str(REC_RATE), "-f", "s24le", "-"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
-        incoming = lambda: (played.stdout.read(REC_BLOCK), False)
+        played = wave.open(spec["file"])
+        width, count = played.getsampwidth(), played.getnchannels()
+
+        def incoming():
+            raw = np.frombuffer(played.readframes(REC_RATE // 10), np.uint8).reshape(-1, count, width).astype(np.int32)
+            v = (raw[..., -1] ^ 0x80) - 0x80  # the top byte carries the sign; whatever the depth, made 24-bit
+            for i in range(2, width + 1):
+                v = v << 8 | raw[..., -i]
+            v = v << 8 * (3 - width) if width < 3 else v >> 8 * (width - 3)
+            return np.ascontiguousarray(v[:, [int(spec["left"]), int(spec["right"])]], "<i4").view(np.uint8).reshape(-1, 4)[:, :3].tobytes(), False
     else:
         # The sound system hands over every buffer by calling arrived(), and they wait in a queue until taken:
         # nothing is skipped because this program was busy. (ffmpeg's own Mac input keeps only the newest buffer,
