@@ -238,7 +238,10 @@ def main():
         call("PUT", "/api/library", {"folder": str(tmp / "Transfers"), "depth": 3})
         assert "name" in refused("/api/record", {"tape": " ", "side": "Side A"})["error"]
         assert call("POST", "/api/record", {"tape": "Reel: one", "side": "Side A"})["state"] == "waiting"
-        done = wait("the side to end by itself", lambda: call("GET", "/api/record")["last"], 1)
+        try:
+            done = wait("the side to end by itself", lambda: call("GET", "/api/record")["last"], 1)
+        except AssertionError:  # what the recorder last said is the clue, and it is not in the app's log
+            raise AssertionError(f"the side did not end; the recorder's state: {call('GET', '/api/record')}")
         master = tmp / "Transfers" / "Reel_ one" / "Side A.wav"
         # A second of the stopped deck before the sound, all six seconds of it, and three after.
         assert (done["why"], done["seconds"], done["auto"], done["clipped"], done["lost"], Path(done["file"])) == ("the side ended", 10.0, True, [], [], master), done
