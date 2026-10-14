@@ -354,6 +354,12 @@ def recorder(spec):
         except OSError:
             pass  # the app has gone: the side is still finished properly
 
+    # Everything is loaded before a thread starts waiting on standard input: on Windows, loading numpy
+    # while another thread waits on that pipe never finishes.
+    import wave
+    import numpy as np
+    if not spec.get("file"):
+        import sounddevice as sd
     orders = queue.Queue()
 
     def listen_for_orders():
@@ -363,13 +369,8 @@ def recorder(spec):
     threading.Thread(target=listen_for_orders, daemon=True).start()
     if spec.get("file"):
         # Tests: a WAV at 48 kHz stands in for an input. It would be over before Record was pressed, so it waits for that.
-        import wave
-        import numpy as np
-        print(json.dumps({"test": "1 waiting for Record"}), flush=True)
         orders.put(orders.get())
-        print(json.dumps({"test": "2 opening the file"}), flush=True)
         played = wave.open(spec["file"])
-        print(json.dumps({"test": "3 opened"}), flush=True)
         width, count = played.getsampwidth(), played.getnchannels()
 
         def incoming():
@@ -384,7 +385,6 @@ def recorder(spec):
         # nothing is skipped because this program was busy. (ffmpeg's own Mac input keeps only the newest buffer,
         # and on the interface this was built with it lost one in nine.) If the sound system itself ever has to
         # throw sound away it says so, and so does a jump in the buffers' own clock: either way the side is told.
-        import sounddevice as sd
         waiting, clock = queue.Queue(), {"next": None}
 
         def arrived(data, frames, when, status):
@@ -428,11 +428,8 @@ def recorder(spec):
     kept_at_last_settle = 0
     top, quietest = [-200.0, -200.0], 0.0  # the loudest each channel has been and the quietest the input has been, since asked to forget
     lost = []  # where in the side being kept the sound system lost sound, in seconds
-    first = bool(spec.get("file"))
     while True:
-        first and print(json.dumps({"test": "4 reading"}), flush=True)
         block, gap = incoming()  # waits until a tenth of a second has come in
-        first and print(json.dumps({"test": f"5 read {len(block)}"}), flush=True)
         closing = False
         while not orders.empty():
             order = orders.get()
@@ -453,9 +450,7 @@ def recorder(spec):
             break
         if gap and side and side.state == "playing":
             lost.append(side.kept / 10)
-        first and print(json.dumps({"test": "6 measuring"}), flush=True)
         level, left, right, clipped = measure(block)
-        first and print(json.dumps({"test": "7 measured"}), flush=True)
         top, quietest = [max(top[0], left), max(top[1], right)], min(quietest, level)
         if side:
             try:
@@ -470,8 +465,6 @@ def recorder(spec):
                 finish(f"it could not be written: {e}")
         if side and side.state == "over":
             finish("the side ended")
-        first and print(json.dumps({"test": "8 heard"}), flush=True)
-        first = False
         learning = bool(side) and side.below is None and side.floor is None
         say(l=left, r=right, clip=clipped, level=level, top=top, quietest=quietest, state=side.state if side else "listening",
             seconds=side.kept / 10 if side else 0, stopped=len(side.held) / 10 if side else 0,
